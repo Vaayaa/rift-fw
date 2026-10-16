@@ -143,6 +143,7 @@ define("ATT_F_STEP", Q24 / (0.003 * FS))     # filter env attack 3 ms (Q24 per s
 define("ATT_A_STEP", Q24 / (0.001 * FS))     # amp attack 1 ms
 arr("K_REL_T", [kexp((1 + i * 199 / 63) / 1000 / 3) for i in range(64)])   # amp release 1..200 ms
 arr("K_GLIDE_T", [kexp(0.025 + 0.09 * i / 63) for i in range(64)])
+arr("K_DIVE_T", [kexp(0.04 + 0.16 * i / 63) for i in range(64)])        # DIVE's fall, by its TIME knob
 arr("K_IDX_T", [kexp((0.12 + 0.18 * i / 63) / 3) for i in range(64)])   # GROWL's FM index envelope, by DEC
 # accent capacitor: charge / discharge time against resonance (64 steps)
 arr("K_CAPC_T", [round((1 - math.exp(-1 / (FS * (0.002 + 0.043 * i / 63)))) * Q30) for i in range(64)])

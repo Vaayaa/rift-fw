@@ -88,9 +88,13 @@ _Static_assert(UA_HI48 + UA_REND48 + UA_MAXF < UA_N, "the ring holds the band, a
 #endif
 #define UAC_MAXP (UA_MAXF * 4u)
 _Static_assert(UA_HI + HALF_FRAMES + UA_MAXF < UA_N, "the ring holds the band, a render and a packet");
-static uint32_t ua_ring[UA_N];
+/* RIFT 0.3, after JIANT 0.7.1's USB STEMS: 8 channels (master L R, bass L R, drums L R, delay return L R), 4 words a
+ * frame in the ring, 44.1 kHz only; the device re-enumerates as another (bcdDevice + 0x40) when it switches */
+static volatile uint8_t usb_stems;
+#define UA_FW (usb_stems ? 4u : 1u)
+static uint32_t ua_ring[UA_N * 4u] __attribute__((section(".pool")));
 static volatile uint32_t ua_w, ua_r;
-static uint32_t ep4tx[UA_MAXF] __attribute__((aligned(4)));
+static uint32_t ep4tx[UA_MAXF * 4u] __attribute__((aligned(4)));
 static struct {
     volatile uint8_t alt;        /* streaming interface setting: 1 = the host records */
     volatile uint8_t r48;        /* the host's rate (SET_CUR): 1 = 48 kHz, 0 = 44.1 (bus reset) */
@@ -103,7 +107,7 @@ static struct {
     uint8_t e0_rx;               /* SET_CUR sampling frequency: data stage pending */
     volatile uint32_t fill_min;  /* ring fill when the last render started */
     uint32_t acc;                /* 44.1 frames per ms: 0.1 frame steps */
-    uint32_t last;               /* the last frame sent, repeated on an underrun */
+    uint32_t last[4];               /* the last frame sent, repeated on an underrun */
     uint32_t starts, pkts, frames;               /* frames in packets sent from the ring */
     uint32_t underruns, overruns, missed;        /* glitches: ring empty (repeat), ring full (drop), no packet ready */
     uint32_t stalls;                             /* the host stopped reading for > 20 ms (alt still 1) */
@@ -146,7 +150,7 @@ static struct {
 /* M-UPGRADE SysEx (ota.c): one received frame at a time (7-bit bytes between
  * F0 and F7; frames arriving while one is pending are dropped, the host
  * retries), and a TX ring of SysEx event packets sent before any MIDI. */
-static uint8_t sx_frame[640];
+static uint8_t sx_frame[1024];
 static uint32_t sx_pos;
 static volatile uint32_t sx_frame_len;
 static volatile uint8_t sx_ready, sx_collect, sx_busy;
@@ -237,6 +241,37 @@ static const uint8_t CFG_DESC[] = {
 #endif
 };
 typedef char cfg_len_ok[sizeof CFG_DESC == CFG_LEN ? 1 : -1];
+#if FELUCCA_UAC && !FELUCCA_CDC
+/* the stems' device: the same with 8 channels at 44.1 kHz, bcdDevice + 0x40 (hosts cache descriptors per version) */
+#define CFG8_LEN (101 + 74 + 0)
+#define UAC_MAXP8 ((UA_MAXF) * 16u)
+static const uint8_t DEV_DESC8[18] = {18, 1, 0x10, 0x01, 0, 0, 0, 64, 0x09, 0x12, FELUCCA_USB_PID & 0xFF,
+                                      FELUCCA_USB_PID >> 8, 0x40 + 0x10 * (FELUCCA_UAC + FELUCCA_UAC_48K), 0x03, 1, 2, 0, 1};
+static const uint8_t CFG_DESC8[] = {
+    9, 2, CFG8_LEN & 0xFF, CFG8_LEN >> 8, USB_NIF, 1, 0, 0x80, 50,
+    9, 4, 0, 0, 0, 1, 1, 0, 0,
+    10, 0x24, 1, 0x00, 0x01, 31, 0, 2, 1, UAC_AS_IF,
+    12, 0x24, 2, 1, 0x03, 0x06, 0, 8, 0x00, 0x00, 0, 0, /* input terminal 1: line, 8 ch */
+    9, 0x24, 3, 2, 0x01, 0x01, 0, 1, 0,
+    9, 4, 1, 0, 2, 1, 3, 0, 0,
+    7, 0x24, 1, 0x00, 0x01, 0x41, 0x00,
+    6, 0x24, 2, 1, 1, 0,
+    6, 0x24, 2, 2, 2, 0,
+    9, 0x24, 3, 1, 3, 1, 2, 1, 0,
+    9, 0x24, 3, 2, 4, 1, 1, 1, 0,
+    9, 5, 0x01, 2, 64, 0, 0, 0, 0,
+    5, 0x25, 1, 1, 1,
+    9, 5, 0x81, 2, 64, 0, 0, 0, 0,
+    5, 0x25, 1, 1, 3,
+    9, 4, UAC_AS_IF, 0, 0, 1, 2, 0, 0,
+    9, 4, UAC_AS_IF, 1, 1, 1, 2, 0, 0,
+    7, 0x24, 1, 2, 1, 0x01, 0x00,
+    11, 0x24, 2, 1, 8, 2, 16, 1, UAC_RATE & 0xFF, (UAC_RATE >> 8) & 0xFF, UAC_RATE >> 16,   /* type I: 8 ch, 16 bit */
+    9, 5, 0x84, 0x05, UAC_MAXP8 & 0xFF, UAC_MAXP8 >> 8, 1, 0, 0,
+    7, 0x25, 1, 0x01, 0, 0, 0,
+};
+typedef char cfg8_len_ok[sizeof CFG_DESC8 == CFG8_LEN ? 1 : -1];
+#endif
 #if FELUCCA_CDC
 /* SLOOP 2.4, after Felucca 1.0.3 (#67): menu USB SERIAL. ON presents the serial console as before (the
  * descriptors above, byte for byte); OFF, the default, presents the device as a FELUCCA_CDC=0 build does: class 0,
@@ -271,7 +306,7 @@ static const uint8_t STR1[] = {42, 3, 'H', 0, 0xFC, 0, 'g', 0, 'e', 0, 'l', 0, '
 static const uint8_t STR2[] = {30, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c', 0, 'a', 0, ' ', 0, 'U', 0, 'p', 0,
                                'd', 0, 'a', 0, 't', 0, 'e', 0};
 #else
-static const uint8_t STR2[] = {16, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c', 0, 'a', 0};
+static const uint8_t STR2[] = {20, 3, 'R', 0, 'I', 0, 'F', 0, 'T', 0, ' ', 0, 'F', 0, 'M', 0, '-', 0, '1', 0};
 #endif
 
 static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
@@ -280,6 +315,9 @@ static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
     case 1:
         *d = DEV_DESC;
         *l = sizeof DEV_DESC;
+#if FELUCCA_UAC && !FELUCCA_CDC
+        if (usb_stems) { *d = DEV_DESC8; return 1; }
+#endif
 #if FELUCCA_CDC
         if (!usb_cdc_on)
             *d = DEV_DESC_PLAIN;
@@ -288,6 +326,9 @@ static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
     case 2:
         *d = CFG_DESC;
         *l = sizeof CFG_DESC;
+#if FELUCCA_UAC && !FELUCCA_CDC
+        if (usb_stems) { *d = CFG_DESC8; *l = sizeof CFG_DESC8; return 1; }
+#endif
 #if FELUCCA_CDC
         if (!usb_cdc_on) {
             *d = cfg_plain_get();
@@ -367,7 +408,7 @@ static void uac_stream(uint32_t alt)                    /* SET_INTERFACE, config
     RING_PUBLISH();
     uac.alt = (uint8_t)alt;
     uac.acc = 0;
-    uac.last = 0;
+    uac.last[0] = uac.last[1] = uac.last[2] = uac.last[3] = 0;
     if (alt) {                                          /* (the fill range of the last stream stays readable) */
         uac.starts++;
         uac.fill_lo = 0xFFFFFFFFu;
@@ -382,7 +423,7 @@ static void uac_stream(uint32_t alt)                    /* SET_INTERFACE, config
  * the stream: silence packets until the next render primes the ring at the new rate. */
 static void uac_rate_set(uint32_t hz)
 {
-    uint8_t r48 = (uint8_t)(FELUCCA_UAC_48K && hz >= (UAC_RATE + 48000u) / 2u);
+    uint8_t r48 = (uint8_t)(FELUCCA_UAC_48K && !usb_stems && hz >= (UAC_RATE + 48000u) / 2u);
     if (r48 == uac.r48)
         return;
     uac.go = 0;
@@ -714,6 +755,10 @@ static void sysex_byte(uint8_t b)
         else if (usb.sx_len == 6u && usb.sysex[1] == 0x22 && usb.sysex[2] == 0x24 && usb.sysex[3] == 0x35 &&
                  usb.sysex[4] == 0x7F)
             usb.ota_req = 1;
+#ifdef USB_APP_HOOKS
+        else if (sx_collect && sx_pos >= 5u && sx_frame[0] == 0x7D && sx_frame[1] == 'R')
+            dna_rx_frame(sx_frame, sx_pos);              /* (RIFT: a pattern's DNA, not the update's) */
+#endif
         else if (sx_collect && sx_pos) {
             sx_frame_len = sx_pos;
             RING_PUBLISH();
@@ -744,11 +789,15 @@ static void midi_in_event(uint32_t pkt)
 #endif
     }
     if (cin == 0xFu && (st == 0xF8u || st == 0xFAu || st == 0xFBu || st == 0xFCu)) {   /* clock, transport */
+#ifdef USB_APP_HOOKS
+        clk_push(st, 0);                               /* (the app: stamped, for the audio ISR) */
+#else
         if (mi_w - mi_r < MQ) {
             midi_in_q[mi_w % MQ] = 0xFu | st << 8;
             RING_PUBLISH();
             mi_w++;
         }
+#endif
         return;
     }
     if (cin >= 8u && cin <= 0xEu && (st >> 4) == cin && !((pkt >> 16) & 0x80u) &&
@@ -985,8 +1034,8 @@ static __attribute__((noinline)) void uac_render_start(void)   /* audio ISR, bef
             rs.w = rs.ph = 0;
         }
 #endif
-        for (i = 0; i < prime; i++)
-            ua_ring[(r + i) & (UA_N - 1u)] = 0;
+        for (i = 0; i < prime * UA_FW; i++)
+            ua_ring[((r + i / UA_FW) & (UA_N - 1u)) * UA_FW + i % UA_FW] = 0;
         RING_PUBLISH();
         ua_w = r + prime;
         uac.fill_min = prime;
@@ -1060,7 +1109,7 @@ static __attribute__((noinline)) void uac_tap48(const int32_t *out, uint32_t n)
 static __attribute__((noinline)) void uac_tap(const int32_t *out, uint32_t n)   /* audio ISR: one block (Q15) */
 {
     uint32_t w = ua_w, i;
-    if (!uac.feed)
+    if (!uac.feed || usb_stems)
         return;
 #if FELUCCA_UAC_48K
     if (uac.ring48) {
@@ -1092,6 +1141,29 @@ static __attribute__((noinline)) void uac_tap(const int32_t *out, uint32_t n)   
     ua_w = w + n;
 }
 
+/* the stems: a block as 8 channels: the master as the stereo stream has it (out, Q15, after the MASTER knob), then
+ * the app's three pairs (st: bass L R, drums L R, delay return L R a frame, Q15) */
+static __attribute__((noinline)) void uac_tap8(const int32_t *out, const int16_t *st, uint32_t n)
+{
+    uint32_t w = ua_w, i;
+    if (!uac.feed || !usb_stems)
+        return;
+    if (UA_N - (w - ua_r) < n) {
+        uac.overruns++;
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t *f = &ua_ring[((w + i) & (UA_N - 1u)) * 4u];
+        const int16_t *q = &st[6u * i];
+        f[0] = (uint32_t)(uint16_t)uac_s16(out[2u * i]) | (uint32_t)(uint16_t)uac_s16(out[2u * i + 1u]) << 16;
+        f[1] = (uint32_t)(uint16_t)q[0] | (uint32_t)(uint16_t)q[1] << 16;
+        f[2] = (uint32_t)(uint16_t)q[2] | (uint32_t)(uint16_t)q[3] << 16;
+        f[3] = (uint32_t)(uint16_t)q[4] | (uint32_t)(uint16_t)q[5] << 16;
+    }
+    RING_PUBLISH();
+    ua_w = w + n;
+}
+
 /* the next packet into d: 44 / 45 frames (+-1 to hold the ring's fill), from the ring or, until it is
  * primed, silence. An empty ring repeats the last frame. Returns the frame count. */
 static uint32_t uac_packet(uint32_t *d)
@@ -1112,7 +1184,7 @@ static uint32_t uac_packet(uint32_t *d)
         }
     }
     if (!uac.go || uac.ring48 != uac.r48) {             /* not primed (at this rate) yet */
-        for (i = 0; i < n; i++)
+        for (i = 0; i < n * UA_FW; i++)
             d[i] = 0;
         return n;
     }
@@ -1127,15 +1199,20 @@ static uint32_t uac_packet(uint32_t *d)
     fill = ua_w - r;
     RING_PUBLISH();                                     /* the slots after the index */
     k = fill < n ? fill : n;
-    for (i = 0; i < k; i++)
-        d[i] = ua_ring[(r + i) & (UA_N - 1u)];
-    if (k < n) {
-        uint32_t last = k ? d[k - 1u] : uac.last;
-        uac.underruns++;
-        for (; i < n; i++)
-            d[i] = last;
+    {
+        uint32_t W = UA_FW, j;
+        for (i = 0; i < k; i++)
+            for (j = 0; j < W; j++)
+                d[i * W + j] = ua_ring[((r + i) & (UA_N - 1u)) * W + j];
+        if (k < n) {
+            uac.underruns++;
+            for (; i < n; i++)
+                for (j = 0; j < W; j++)
+                    d[i * W + j] = k ? d[(k - 1u) * W + j] : uac.last[j];
+        }
+        for (j = 0; j < W; j++)
+            uac.last[j] = d[(n - 1u) * W + j];
     }
-    uac.last = d[n - 1u];
     RING_PUBLISH();
     ua_r = r + k;
     uac.pkts++;
@@ -1169,7 +1246,7 @@ static void uac_service(void)
     uac.queued = 1;
     uac.wait = 0;
     n = uac_packet(ep4tx);
-    fm1_usb_ep4_send(ep4tx, n * 4u);
+    fm1_usb_ep4_send(ep4tx, n * 4u * UA_FW);
     sie_wr(S_TXCSR1, 0x01);                             /* TxPktRdy (and UnderRun cleared) */
 }
 #endif
@@ -1303,3 +1380,22 @@ static void usb_detach(void)
     usb.up = 0;
     fm1_usb_off();
 }
+
+#if FELUCCA_UAC && !FELUCCA_CDC
+/* SYS > USB: the device re-enumerates with the 8 channels (on) or the stereo stream (as JIANT's usb_stems_switch) */
+static void usb_stems_set(uint32_t on)
+{
+    on = on != 0;
+    if (on == usb_stems)
+        return;
+    if (usb.up) {
+        usb.up = 0;
+        RING_PUBLISH();
+        fm1_usb_off();
+    }
+    usb.config = 0;
+    uac.go = 0;
+    uac.r48 = 0;
+    usb_stems = (uint8_t)on;
+}
+#endif

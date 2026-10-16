@@ -51,6 +51,9 @@ static int fm1_mc_run(void (*fn)(uint32_t), uint32_t a)
 }
 static int fm1_mc_wait(void) { if (host_mc_fn) { host_mc_fn(host_mc_arg); host_mc_fn = 0; } return 0; }
 static const char *mc_status(void) { return host_mc > 0 ? "2 CORES" : "1 CORE"; }
+static volatile uint8_t usb_stems;
+static int16_t stem_q[HALF_FRAMES * 6u];
+static void usb_stems_set(uint32_t on) { usb_stems = (uint8_t)(on != 0); printf("%6u ms  USB re-enumerates: %s\n", fm1_ms, on ? "8 ch stems" : "stereo"); }
 
 /* the screen: 240 x 240 RGB565, as the ST7789 gets it (gfx.c sends the bytes swapped) */
 static uint16_t fb[240 * 240];
@@ -75,17 +78,20 @@ static void lcd_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint1
 #define CV_MAX (240u * 124u)
 #include "gfx.c"
 
-static uint8_t host_store[256 + 4];
+static uint8_t host_store[3072 + 8];   /* (like the flash: the size is part of the record; a different size does not load) */
 static int settings_load(void *p, uint32_t n)
 {
-    if (host_store[0] != 1 || n > 256u) return -1;
-    memcpy(p, host_store + 4, n);
+    uint32_t len;
+    memcpy(&len, host_store + 4, 4);
+    if (host_store[0] != 1 || n > 3072u || len != n) return -1;
+    memcpy(p, host_store + 8, n);
     return 0;
 }
 static int settings_save(const void *p, uint32_t n)
 {
     host_store[0] = 1;
-    memcpy(host_store + 4, p, n);
+    memcpy(host_store + 4, &n, 4);
+    memcpy(host_store + 8, p, n);
     printf("%6u ms  settings saved (%u B)\n", fm1_ms, n);
     return 0;
 }
@@ -100,13 +106,33 @@ static int midi_get(uint8_t *st, uint8_t *d1, uint8_t *d2)
     return 1;
 }
 static void midi_send(uint32_t st, uint32_t d1, uint32_t d2) { printf("%6u ms  MIDI out %02X %u %u\n", fm1_ms, st, d1, d2); }
+/* MIDI clock in, stamped (platform.c's clk_q): "T clock BPM [JITTER_US]" sends 24 ppqn from T, "T clock 0" stops */
+#define CKN 64u
+static struct { uint32_t t; uint8_t st, src; } clk_q[CKN];
+static volatile uint32_t ck_w, ck_r;
+static uint64_t host_us;                       /* the host's time, us */
+static void clk_push_at(uint32_t st, uint64_t us) { if (ck_w - ck_r < CKN) { clk_q[ck_w % CKN].t = (uint32_t)(us * 24u); clk_q[ck_w % CKN].st = (uint8_t)st; clk_q[ck_w % CKN].src = 0; ck_w++; } }
+static uint32_t clk_now(void) { return (uint32_t)(host_us * 24u); }
+static uint8_t dna_rx[1024];
+static volatile uint32_t dna_rx_len;
+static void dna_rx_frame(const uint8_t *f, uint32_t n)
+{
+    if (dna_rx_len || n < 5u || n > sizeof dna_rx || f[0] != 0x7D || f[1] != 'R') return;
+    memcpy(dna_rx, f, n); dna_rx_len = n;
+}
+static int ota_wire_send(const uint8_t *p, uint32_t n)   /* SysEx out: printed; HOST_DNA_LOOP=1 hears itself */
+{
+    printf("%6u ms  SysEx out %u B\n", fm1_ms, n);
+    if (getenv("HOST_DNA_LOOP") && n > 2u) dna_rx_frame(p + 1, n - 2u);
+    return 0;
+}
 
 static void app_audio(int32_t *out, uint32_t n);
 static void app_main(void);
 
 /* the script: at t ms, keys down (bit k = key k, 0 = F3), a button edge, a MIDI message. A script file (the second
  * argument) replaces it, a line each: "T keys MASK" (hex or decimal), "T btn ID", "T midi ST D1 D2", "T end" */
-typedef struct { uint32_t t, keys; int btn; uint8_t st, d1, d2; int up, enc, det; } host_ev_t;
+typedef struct { uint32_t t, keys; int btn; uint8_t st, d1, d2; int up, enc, det, clk, jit; } host_ev_t;
 static const host_ev_t SCRIPT0[] = {
     {200, 1u << 7, -1, 0, 0, 0, 0, -1, 0},                                /* C4 */
     {700, 1u << 7 | 1u << 11 | 1u << 14, -1, 0, 0, 0, 0, -1, 0},          /* + E4 G4: a chord */
@@ -140,6 +166,7 @@ static void read_script(const char *path)
         else if (!strcmp(what, "btn")) { sscanf(line, "%*u %*s %d", &e.btn); }
         else if (!strcmp(what, "btnup")) { sscanf(line, "%*u %*s %d", &e.btn); e.up = 1; }
         else if (!strcmp(what, "enc")) { sscanf(line, "%*u %*s %d %d", &e.enc, &e.det); }
+        else if (!strcmp(what, "clock")) { e.jit = 0; sscanf(line, "%*u %*s %d %d", &e.clk, &e.jit); e.clk = e.clk ? e.clk : -1; }
         else if (!strcmp(what, "midi")) { sscanf(line, "%*u %*s %i %u %u", (int *)&a, &b, &c); e.st = (uint8_t)a; e.d1 = (uint8_t)b; e.d2 = (uint8_t)c; }
         else continue;
         ev[n++] = e;
@@ -192,11 +219,19 @@ static void write_wav(void)
 
 static void platform_poll(void)                 /* one call = one millisecond */
 {
-    static uint32_t step, shot, owed, frame;
+    static uint32_t step, shot, owed, frame, cbpm, cjit, rnd = 12345;
+    static uint64_t cnext;
     static int32_t blk[2u * HALF_FRAMES];
     fm1_ms++;
+    host_us = (uint64_t)fm1_ms * 1000u;
     while (step < script_n && script[step].t <= fm1_ms) {
-        if (script[step].st) {
+        if (script[step].clk) {
+            cbpm = script[step].clk > 0 ? (uint32_t)script[step].clk : 0u; cjit = (uint32_t)script[step].jit;
+            if (cbpm) { cnext = host_us; clk_push_at(0xFA, host_us); }
+            else clk_push_at(0xFC, host_us);
+        } else if (script[step].st >= 0xF8u)
+            clk_push_at(script[step].st, host_us);
+        else if (script[step].st) {
             mq[mq_w % 64u][0] = script[step].st; mq[mq_w % 64u][1] = script[step].d1; mq[mq_w % 64u][2] = script[step].d2;
             mq_w++;
         } else if (script[step].enc >= 0)
@@ -208,6 +243,11 @@ static void platform_poll(void)                 /* one call = one millisecond */
         } else
             fm1_in.notes = script[step].keys;
         step++;
+    }
+    while (cbpm && cnext <= host_us) {          /* the clock: 24 ppqn, the stamp late by up to JITTER us */
+        rnd = rnd * 1103515245u + 12345u;
+        clk_push_at(0xF8, cnext + (cjit ? (rnd >> 8) % cjit : 0u));
+        cnext += 60000000u / (cbpm * 24u);
     }
     owed += FS;                                 /* the frames this millisecond is worth, in blocks as the ISR renders */
     while (owed >= 1000u * HALF_FRAMES) {

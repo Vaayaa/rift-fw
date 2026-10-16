@@ -65,7 +65,59 @@ static volatile uint32_t fm1_ms;                /* milliseconds since power-on (
 #define FELUCCA_CDC 0
 #define FELUCCA_UAC 1
 #define FELUCCA_UART 0
+/* MIDI clock and transport from USB and the TRS input, stamped as they arrive (TIMER4, 24 MHz): the audio ISR follows */
+#define CKN 64u
+static struct { uint32_t t; uint8_t st, src; } clk_q[CKN];
+static volatile uint32_t ck_w, ck_r;
+static void clk_push(uint32_t st, uint32_t src)
+{
+    if (ck_w - ck_r < CKN) {
+        clk_q[ck_w % CKN].t = fm1_ticks(); clk_q[ck_w % CKN].st = (uint8_t)st; clk_q[ck_w % CKN].src = (uint8_t)src;
+        RING_PUBLISH();
+        ck_w++;
+    }
+}
+static uint32_t clk_now(void) { return fm1_ticks(); }
+/* RIFT's own SysEx (F0 7D 'R' 'I' 'F' 'T' ...: a pattern's DNA from another unit), for the main loop */
+static uint8_t dna_rx[1024] __attribute__((section(".lowbuf")));
+static volatile uint32_t dna_rx_len;           /* set by the TIMER5 ISR, cleared by the main loop */
+static void dna_rx_frame(const uint8_t *f, uint32_t n)   /* f: without F0 / F7 */
+{
+    if (dna_rx_len || n < 5u || n > sizeof dna_rx || f[0] != 0x7D || f[1] != 'R' || f[2] != 'I' || f[3] != 'F' || f[4] != 'T') return;
+    memcpy(dna_rx, f, n);
+    RING_PUBLISH();
+    dna_rx_len = n;
+}
+#define USB_APP_HOOKS 1
 #include "usb.c"
+#include "fm1_uart.h"
+/* MIDI IN on the TRS jack (input only: the FM-1 has no TRS output): PH8, UART1 RX, 31250 baud, RX DMA into a ring,
+ * polled at 2 kHz (as JIANT's midi_uart.c): channel messages join USB's, clock and transport go to clk_q, SysEx to
+ * dna_rx_frame */
+#define UM_RING 128u
+static volatile uint8_t um_ring[UM_RING] __attribute__((aligned(16)));
+static struct { uint32_t rd, pend; uint8_t st, need, got, d0, sx; uint32_t sxn; uint8_t sxb[1024]; } um;
+static void um_byte(uint32_t b)
+{
+    if (b >= 0xF8u) { if (b == 0xF8u || b == 0xFAu || b == 0xFBu || b == 0xFCu) clk_push(b, 1); return; }
+    if (b == 0xF0u) { um.sx = 1; um.sxn = 0; um.st = 0; return; }
+    if (b == 0xF7u) { if (um.sx) dna_rx_frame(um.sxb, um.sxn); um.sx = 0; return; }
+    if (b & 0x80u) { um.sx = 0; um.st = b < 0xF0u ? (uint8_t)b : 0; um.need = (b & 0xE0u) == 0xC0u ? 1u : 2u; um.got = 0; return; }
+    if (um.sx) { if (um.sxn < sizeof um.sxb) um.sxb[um.sxn++] = (uint8_t)b; else um.sx = 0; return; }
+    if (!um.st) return;
+    if (um.need == 2u && !um.got) { um.d0 = (uint8_t)b; um.got = 1; return; }
+    {
+        uint32_t d1 = um.need == 2u ? um.d0 : b, d2 = um.need == 2u ? b : 0u, pkt = (um.st >> 4) | (uint32_t)um.st << 8 | d1 << 16 | d2 << 24;
+        um.got = 0;
+        if (mi_w - mi_r < MQ) { midi_in_q[mi_w % MQ] = pkt; RING_PUBLISH(); mi_w++; }
+    }
+}
+static void uart_midi_poll(void)
+{
+    um.pend += fm1_uart1_rx_take();
+    if (um.pend > UM_RING) { um.rd = (um.rd + um.pend - UM_RING) & (UM_RING - 1u); um.pend = UM_RING; um.st = um.got = um.sx = 0; }
+    while (um.pend) { um_byte(um_ring[um.rd]); um.rd = (um.rd + 1u) & (UM_RING - 1u); um.pend--; }
+}
 
 /* ---- flash: read anywhere; erase / program only the update's staging area and the settings sector */
 #define SETTINGS_AT 0x000FC000u                 /* one 4 KiB sector of Felucca's globals area */
@@ -148,7 +200,7 @@ static uint32_t crc32(const uint8_t *p, uint32_t n)
 }
 static int settings_load(void *p, uint32_t n)   /* 0: loaded; else p is untouched */
 {
-    static uint8_t buf[256];
+    static uint8_t buf[3072] __attribute__((section(".lowbuf")));
     uint32_t h[3];
     if (!flash_ok || n > sizeof buf || st_read(SETTINGS_AT, h, sizeof h) || h[0] != SETTINGS_MAGIC || h[1] != n)
         return -1;
@@ -157,11 +209,11 @@ static int settings_load(void *p, uint32_t n)   /* 0: loaded; else p is untouche
     memcpy(p, buf, n);
     return 0;
 }
-static int settings_save(const void *p, uint32_t n)   /* p in RAM, n <= 256 */
+static int settings_save(const void *p, uint32_t n)   /* p in RAM, n <= 3072 */
 {
     uint32_t h[3] = {SETTINGS_MAGIC, n, 0}, took;
     int rc;
-    if (!flash_ok || n > 256u)
+    if (!flash_ok || n > 3072u)
         return -1;
     h[2] = crc32(p, n);
     if ((rc = fl_erase4k(SETTINGS_AT, &took)) != 0)
@@ -213,8 +265,10 @@ void fm1_timer5_irq(void)
             uac_service();
         return;
     }
-    if (owed)
+    if (owed) {
         usb_poll();
+        uart_midi_poll();
+    }
     owed = 0;
 }
 extern void isr_timer5(void);
@@ -234,6 +288,7 @@ static int32_t abuf[2u * HALF_WORDS] __attribute__((aligned(4)));
 static volatile int32_t master_q12 = 2048;
 static void app_audio(int32_t *out, uint32_t n);
 static void app_main(void);
+static int16_t stem_q[HALF_FRAMES * 6u];        /* the app's stems for USB (bass L R, drums L R, delay L R), Q15 */
 
 void fm1_alnk0_irq(void)                       /* via isr_alnk0 (hal/fm1_isr.S) */
 {
@@ -252,8 +307,11 @@ void fm1_alnk0_irq(void)                       /* via isr_alnk0 (hal/fm1_isr.S) 
             int32_t v = (o[i] * master_q12) >> 12;
             o[i] = v > 32767 ? 32767 : v < -32767 ? -32767 : v;
         }
-        for (b = 0; b < HALF_FRAMES; b += 32u)
-            uac_tap(o + 2u * b, 32u);           /* the computer records what the speaker plays */
+        if (usb_stems)
+            uac_tap8(o, stem_q, HALF_FRAMES);   /* SYS > USB STEMS: the master and the app's three pairs */
+        else
+            for (b = 0; b < HALF_FRAMES; b += 32u)
+                uac_tap(o + 2u * b, 32u);       /* the computer records what the speaker plays */
         for (i = 0; i < HALF_WORDS; i++)
             o[i] <<= 7;
         fm1_audio_ack_half();
@@ -353,6 +411,7 @@ void fm1_cstart(void)
     fm1_adc_init();
     fm1_audio_init(abuf, HALF_WORDS, isr_alnk0, 3);   /* (abuf is zero: .bss) */
     usb_start();
+    fm1_uart1_midi_init(um_ring, UM_RING);     /* (before TIMER5: PORTH read-modify-write) */
     fm1_timer5_start(isr_timer5, 4);
     fm1_guard_lock_top();
     fm1_irq_enable_all();
