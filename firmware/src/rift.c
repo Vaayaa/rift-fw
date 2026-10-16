@@ -371,13 +371,27 @@ static uint32_t lane_index(const lane_t *L, uint32_t c, uint32_t seed, uint32_t 
 }
 
 /* ================================================================== presets (sound) */
-typedef struct { const char *name; uint16_t cut, res, env, dec, acc, burst, wave, dly_send, dly_fb, dly_time, sub, drive; } preset_t;
+/* the engines. CHR, the VOICE page's third knob, is each one's own: ACID the saw -> square wave, RUMBLE the
+ * diffuser loop, REESE the detune, GROWL the FM index, SCREAM the split of its two ladders */
+enum { E_ACID, E_RUMBLE, E_REESE, E_GROWL, E_SCREAM, NENG };
+static const char *const ENG_NAME[NENG] = {"ACID", "RUMBLE", "REESE", "GROWL", "SCREAM"};
+static const char *const CHR_NAME[NENG] = {"WAVE", "RUMBLE", "DETUNE", "FM", "SPLIT"};
+typedef struct {
+    const char *name; uint8_t eng, dly_time, ratio, rel;   /* rel: amp release, ms */
+    uint16_t cut, res, env, dec, acc, burst, chr, dly_send, dly_fb, sub, drive, duck, fold, formant;
+} preset_t;
 #define K(x) ((uint16_t)((x) * 65535))
 static const preset_t PRESETS[] = {
-    {"PHUTURE 88", K(.46), K(.72), K(.55), K(.37), K(.70), K(.15), K(0), K(0), K(.40), 2, 0, 0},
-    {"SQUELCH", K(.28), K(.86), K(.80), K(.18), K(1.0), K(.55), K(1), K(.25), K(.45), 2, 0, 0},
-    {"RUBBER", K(.36), K(.55), K(.45), K(.62), K(.50), K(.25), K(.85), K(.10), K(.35), 3, K(.25), 0},
-    {"DIRT", K(.40), K(.80), K(.65), K(.30), K(.80), K(.85), K(.30), K(.20), K(.40), 2, K(.15), K(.3)},
+    {"PHUTURE 88", E_ACID, 2, 2, 8, K(.46), K(.72), K(.55), K(.37), K(.70), K(.15), K(0), K(0), K(.40), 0, 0, 0, 0, 0},
+    {"SQUELCH", E_ACID, 2, 2, 8, K(.28), K(.86), K(.80), K(.18), K(1.0), K(.55), K(1), K(.25), K(.45), 0, 0, 0, 0, 0},
+    {"RUBBER", E_ACID, 3, 2, 8, K(.36), K(.55), K(.45), K(.62), K(.50), K(.25), K(.85), K(.10), K(.35), K(.25), 0, 0, 0, 0},
+    {"DIRT", E_ACID, 2, 2, 8, K(.40), K(.80), K(.65), K(.30), K(.80), K(.85), K(.30), K(.20), K(.40), K(.15), K(.3), 0, 0, 0},
+    {"BUNKER", E_RUMBLE, 2, 2, 30, K(.19), K(.20), K(.20), K(.50), K(.40), K(.30), K(.70), 0, K(.40), K(.30), K(.6), K(.75), 0, 0},
+    {"PRESSURE", E_RUMBLE, 2, 2, 30, K(.13), K(.25), K(.25), K(.45), K(.50), K(.45), K(.85), 0, K(.40), K(.50), K(.7), K(.90), 0, 0},
+    {"BREAK REESE", E_REESE, 2, 2, 80, K(.48), K(.15), K(.30), K(.50), K(.50), K(.60), K(.50), 0, K(.40), K(.50), 0, 0, 0, 0},
+    {"FIRESTORM", E_REESE, 2, 2, 80, K(.58), K(.20), K(.45), K(.30), K(.60), K(.85), K(.75), K(.20), K(.30), K(.45), 0, 0, 0, 0},
+    {"BLOCK ROCK", E_GROWL, 2, 2, 20, K(.56), K(.40), K(.40), K(.32), K(.60), K(.70), K(.70), 0, K(.40), 0, 0, 0, K(.40), K(.65)},
+    {"ACID SIREN", E_SCREAM, 4, 2, 8, K(.42), K(.93), K(.70), K(.40), K(1.0), K(.85), K(.50), K(.30), K(.50), 0, 0, 0, 0, 0},
 };
 #define NPRESET (sizeof PRESETS / sizeof PRESETS[0])
 
@@ -385,7 +399,8 @@ static const preset_t PRESETS[] = {
 enum { T_RISE, T_ROLL, T_WOW, T_STOP, T_BUILD, T_SHRED, T_FREEZE, T_VOID, NTH };
 static const char *const TH_NAME[NTH] = {"RISE", "ROLL", "WOW", "STOP", "BUILD", "SHRED", "FREEZE", "VOID"};
 typedef struct {
-    int32_t cut, res, env, dec, acc, burst, wave, glide, sub, drive, dly_send, dly_fb, vol, duck, drum_lvl, mod_depth;
+    int32_t cut, res, env, dec, acc, burst, chr, glide, sub, drive, dly_send, dly_fb, vol, duck, drum_lvl, mod_depth;
+    int32_t eng, ratio, rel, fold, formant, harm;     /* the engine; GROWL's FM ratio; amp release (ms); fold; formant */
     int32_t bpm10, swing, dly_time, tension, lock, xfade, pres, vary;
     int32_t drums, kick_tune, root, scale;
     int32_t tp[NTH][4];
@@ -446,6 +461,42 @@ static inline int32_t svf_lp(svf_t *f, int32_t x) { int32_t lp, bp; svf_run(f, x
 static inline int32_t svf_hp(svf_t *f, int32_t x) { int32_t lp, bp; svf_run(f, x, &lp, &bp); return x - m30(bp, K_BW_Q30) - lp; }
 
 typedef struct { int32_t b[HB_N * 2]; uint32_t p; } hb_t;
+/* the ladder (ZDF 4-pole, the HP in the resonance loop, saturation at the loop input, tilted to ~18 dB) */
+typedef struct { int32_t G, G2, G3, G4, om, recip, comp16, k24, hG, a_hp; } ladc_t;
+typedef struct { int32_t s0, s1, s2, s3, hs; } lads_t;
+static void lad_coef(ladc_t *c, int32_t c16, int32_t k24, int32_t hG)
+{
+    int32_t den16;
+    c->G = tabi(G_OS_T, 705, c16);
+    c->G2 = m30(c->G, c->G); c->G3 = m30(c->G2, c->G); c->G4 = m30(c->G2, c->G2); c->om = (1 << 30) - c->G;
+    c->hG = hG; c->a_hp = (1 << 30) - hG; c->k24 = k24;
+    c->comp16 = LCOMP_T[clampi(k24 >> 18, 0, 320)];
+    den16 = ONE16 + (int32_t)(((int64_t)m30(c->a_hp, c->G4) * k24) >> 38);   /* 1 / (1 + k a G^4) */
+    c->recip = (int32_t)((0x40000000u / (uint32_t)den16) << 16);
+}
+HOT_INL int32_t lad_run(lads_t *L, const ladc_t *c, int32_t x)
+{
+    int32_t S = m30(m30(L->s0, c->G3) + m30(L->s1, c->G2) + m30(L->s2, c->G) + L->s3, c->om);
+    int32_t fb = m30(S, c->a_hp) - m30(L->hs, c->a_hp), u, v, y1, y2, y3, y4;
+    u = m30(x - m24(fb, c->k24), c->recip);
+    u = m16(tanh24(m16(u, 98304)), 43691);
+    v = m30(u - L->s0, c->G); y1 = v + L->s0; L->s0 = y1 + v;
+    v = m30(y1 - L->s1, c->G); y2 = v + L->s1; L->s1 = y2 + v;
+    v = m30(y2 - L->s2, c->G); y3 = v + L->s2; L->s2 = y3 + v;
+    v = m30(y3 - L->s3, c->G); y4 = v + L->s3; L->s3 = y4 + v;
+    v = m30(y4 - L->hs, c->hG); L->hs = v + L->hs + v;
+    return m16(y4 + m16(y3 - y4, 9830), c->comp16);
+}
+/* polyBLEP: the correction at a wrap of phase ph (step dt, invdt = 2^31 / (dt >> 12)) */
+HOT_INL int32_t blep(uint32_t ph, uint32_t dt, uint32_t invdt)
+{
+    int32_t u;
+    if (ph < dt) { u = (int32_t)(((uint64_t)(ph >> 12) * invdt) >> 7); return m24(ONE24 - u, ONE24 - u); }
+    if ((uint32_t)-ph < dt) { u = (int32_t)(((uint64_t)((uint32_t)-ph >> 12) * invdt) >> 7); return -m24(ONE24 - u, ONE24 - u); }
+    return 0;
+}
+HOT_INL int32_t saw24(uint32_t ph, uint32_t dt, uint32_t invdt) { return (int32_t)(ph >> 7) - ONE24 + blep(ph, dt, invdt); }
+static uint32_t inv_of(uint32_t dt) { return (uint32_t)(0x80000000u / ((dt >> 12) ? (dt >> 12) : 1u)); }
 static inline void hb_push(hb_t *h, int32_t x) { h->b[h->p] = x; h->b[h->p + HB_N] = x; h->p = h->p + 1u == HB_N ? 0u : h->p + 1u; }
 HOT_INL int32_t hb_out(const hb_t *h)
 {
@@ -461,7 +512,12 @@ static struct {
     int32_t note8, tgt8, envF, amp, accEnv, accCap, wow, vca;
     uint8_t gate, att, ampAtt, acc;
     uint32_t ph, phS, inc, incS, invdt;
-    int32_t s0, s1, s2, s3, hs, G, G2, G3, G4, om, hG, a_hp, recip, k24, comp16;
+    lads_t lad, lad2; ladc_t lc, lc2;                /* SCREAM: the second ladder */
+    uint32_t ph2, ph3, phM, inc2, inc3, incM, inv2, inv3;   /* REESE / SCREAM's other saws, GROWL's modulator */
+    int32_t drift, idx, kIdx, fmI24, eng;           /* REESE's drift; GROWL's index envelope and depth */
+    op1_t rHP1, rHP2;                               /* REESE: the side saws' 120 Hz HP */
+    svf_t gsvf, bp700;                              /* GROWL's resonant SVF; RUMBLE's small speaker */
+    int32_t cA[256], cB[256], clpA, clpB, cda8, cdb8; uint32_t cp, formPh;   /* GROWL's formant combs */
     op1_t preHP, sqHP, sqLP, hump, harmHP, harmLP;
     svf_t xl1, xh2, cab, riseHP;          /* (cab: the coefficients only; its state is stage 2's) */
     int32_t l1sum;                      /* the low band's first LP stage, summed over the two OS samples */
@@ -491,25 +547,33 @@ static struct {
     uint32_t noise;
     int32_t swing16;                        /* the odd steps' swing (this block) */
     uint32_t blk, cur_i;                    /* blocks made by stage 1; the sample being made */
+    int32_t frz_ev, frz_len;                /* FREEZE: an event for stage 2 */
     uint32_t ctr;
 } D;
 
 #define DLY_N 30870u                    /* 0.7 s per channel */
-#define TAPE_N 52920u                   /* 1.2 s mono */
+#define TAPE_N 26460u                   /* 1.2 s mono at half rate (the tape stop) */
+#define FRZ_N 24000u                    /* 1.09 s at half rate: FREEZE's loop of the high band */
+#define RMB_N (573u + 838u + 1279u + 1808u)   /* RUMBLE's diffuser: 13, 19, 29, 41 ms */
 static int16_t dlyL[DLY_N] __attribute__((section(".pool")));
 static int16_t dlyR[DLY_N] __attribute__((section(".pool")));
 static int16_t tape[TAPE_N] __attribute__((section(".pool")));
+static int16_t frz[FRZ_N] __attribute__((section(".pool")));
+static int16_t rmb[RMB_N] __attribute__((section(".lowbuf")));
+static const uint16_t RMB_AT[5] = {0, 573, 573 + 838, 573 + 838 + 1279, RMB_N};
 /* ---------------------------------------------------------------- the block, in two stages
  * Stage 1 (core 0): commands, the sequencer, the voice at 2x, BURST -> the high band at 2x and the low band's first
  *   stage into BK[b & 1], with what stage 2 needs of the control values (every 16 samples) and the drum hits.
  * Stage 2 (core 1, hal/fm1_multicore.h): the decimator, the cabinet, crush, the low band, the tape delay, the
  *   reference drums, the sum, the tape stop, the master -> the output. With two cores it renders block b - 1 while
  *   core 0 makes block b (one block, 5.8 ms, later); with one, block b right after stage 1. */
+#define FO (2u * FS)                            /* the oversampled core's rate */
 #define NB 256u                                 /* frames a block (platform.c HALF_FRAMES) */
 #define NC (NB / 16u)                           /* control ticks a block */
 typedef struct {
     int32_t low16, msub16, burst, crdiv, crbits, void_tgt, send16, dt8, fb, vlp, tr, rmsIn, a1, a2, a3;
-    uint8_t tm, pad[3];
+    int32_t rmb, harm, frz_len, frz_mix, frz_dry, frz_fade;   /* RUMBLE's loop; the low band's harmonics; FREEZE */
+    uint8_t tm, frz_ev, pad[2];                     /* frz_ev: 1 capture frz_len samples, 2 fade out */
 } seg_t;
 typedef struct {
     int32_t hos[2u * NB];                       /* the high band after BURST, at the OS rate (the decimator's input) */
@@ -525,7 +589,9 @@ static struct {                                 /* stage 2's state (core 1's whi
     uint32_t dw, wowph, noise, kPh, kInc, tw, tr16, us;
     int32_t dlpL, dlpR; op1_t dly[4], hHP;
     int32_t kEnv, kP, click, hEnv, kF8;
-    int32_t dcx, dcy, dcxr, dcyr, tape_lp, tape_xf, rms; uint8_t tm_prev;
+    int32_t dcx, dcy, dcxr, dcyr, tape_lp, tape_xf, rms, tacc; uint8_t tm_prev;
+    svf_t hHP1; op1_t hLP, rLP; int32_t rfb, kout; uint32_t rp[4];   /* harmonics; the rumble loop */
+    uint32_t fw, fstart, flen, fpos; int32_t facc, fgain, fon, ffade, fkf;   /* FREEZE (half-rate positions) */
 } S2;
 static int32_t *s2_out;
 
@@ -539,7 +605,7 @@ static void voice_on(int32_t note, int acc, int slide)
 {
     D.tgt8 = note << 8;
     if (!slide) {
-        D.note8 = D.tgt8; D.att = 1; D.ampAtt = 1;
+        D.note8 = D.tgt8; D.att = 1; D.ampAtt = 1; D.idx = ONE24;
         if (D.th[T_WOW].st == 2 && acc) D.wow = clampi(D.wow + (ONE16 * 15 / 100), 0, ONE16 * 6 / 10);
     }
     D.acc = (uint8_t)acc;
@@ -554,12 +620,13 @@ static void th_land(int t, int now)
     if (!D.th[t].st) return;
     D.th[t].st = 0; D.th[t].rel = 0; D.th[t].latched = 0;
     if (t == T_STOP) { D.tape_mode = 0; D.tape_rate16 = ONE16; }
+    if (t == T_FREEZE) D.frz_ev = 2;
     if (t == T_VOID && !now) { D.drop_burst16 = ONE16 * 4 / 10; D.duck_extra = ONE16; emit(EV_DROP, 0, 0, 0); }
     emit(EV_LAND, (uint32_t)t, 0, 0);
 }
 static void th_engage(int t, int latched)
 {
-    if ((t == T_STOP && D.th[T_VOID].st) || (t == T_VOID && D.th[T_STOP].st) || t == T_FREEZE) return;
+    if ((t == T_STOP && D.th[T_VOID].st) || (t == T_VOID && D.th[T_STOP].st)) return;
     D.th[t].latched = (uint8_t)latched; D.th[t].rel = 0;
     if (!D.th[t].st) D.th[t].st = 1; else if (D.th[t].st == 3) D.th[t].st = 2;
 }
@@ -573,10 +640,15 @@ HOT_FN void step_boundary(void)
             D.th[t].send = (s + PL) / PL * PL;
             if (D.th[t].send - s < 16u) D.th[t].send += PL;
             if (t == T_STOP) { D.tape_mode = 1; D.tape_rate16 = ONE16; }
+            if (t == T_FREEZE) {   /* the last 2 / 4 / 8 steps of the high band, looped (shorter if they do not fit) */
+                int32_t n = P.tp[T_FREEZE][0] < ONE16 / 3 ? 2 : P.tp[T_FREEZE][0] < ONE16 * 2 / 3 ? 4 : 8;
+                while (n > 1 && (int32_t)(((int64_t)D.step_len16 * n) >> 16) > (int32_t)(2u * FRZ_N - 512u)) n /= 2;
+                D.frz_ev = 1; D.frz_len = (int32_t)(((int64_t)D.step_len16 * n) >> 16);
+            }
             emit(EV_ENGAGE, (uint32_t)t, 0, 0);
         }
         if (D.th[t].st == 2 && (D.th[t].rel || ((t == T_RISE || t == T_BUILD) && D.th[t].latched && s >= D.th[t].send))) {
-            uint32_t q = (t == T_RISE || t == T_BUILD || t == T_VOID) ? 16u : t == T_STOP ? 4u : 1u;
+            uint32_t q = (t == T_RISE || t == T_BUILD || t == T_VOID) ? 16u : (t == T_STOP || t == T_FREEZE) ? 4u : 1u;
             D.th[t].st = 3; D.th[t].rel = 0;
             D.th[t].land_at = (s + q - 1u) / q * q;
             if (t == T_STOP) { D.th[t].land_at = (s + 2u + 3u) / 4u * 4u; D.spin_from = (int32_t)D.th[t].land_at - 2; }
@@ -712,7 +784,7 @@ HOT_FN void seq_step(void)
 /* ---------------------------------------------------------------- control rate (every 8 samples) */
 HOT_FN void control(void)
 {
-    int32_t sl16 = D.step_len16, gpos16, q16, bx, c16, cut, EM, res, k24, eng303 = 1;
+    int32_t sl16 = D.step_len16, gpos16, q16, bx, c16, cut, EM, res, k24, eng, acid, kt;
     int t;
     /* throws -> modulation bus */
     D.md_cut16 = D.md_res16 = D.md_send16 = D.md_pitch8 = D.md_drive16 = D.md_noise = D.md_force_acc = D.md_hpf = 0;
@@ -761,41 +833,74 @@ HOT_FN void control(void)
     bx = clampi(P.burst + D.md_burst16, 0, ONE16);
     s_burst = bx;
     q16 = bx * 64;                                           /* table index Q16 over 0..64 */
-    D.preG = tabi(eng303 ? BT_PREGA : BT_PREG, 65, q16) + m16(P.drive, 10 * ONE16) / 4 + D.md_drive16 / 4;
-    D.bias = tabi(BT_BIAS, 65, q16); D.tbias = tanh24(D.bias);
-    D.fold16 = m16(tabi(BT_FOLD, 65, q16), ONE16 * 6 / 10);
+    D.preG = tabi(P.eng == E_ACID ? BT_PREGA : BT_PREG, 65, q16) + m16(P.drive, 10 * ONE16) / 4 + D.md_drive16 / 4;
+    if (P.eng == E_GROWL) D.preG = m16(D.preG, ONE16 * 28 / 10); else if (P.eng == E_RUMBLE) D.preG = m16(D.preG, ONE16 * 5 / 2);
+    D.bias = tabi(BT_BIAS, 65, q16) + (P.eng == E_GROWL ? ONE24 * 8 / 100 : 0); D.tbias = tanh24(D.bias);
+    D.fold16 = clampi(m16(tabi(BT_FOLD, 65, q16), P.eng == E_ACID ? ONE16 * 6 / 10 : ONE16) + P.fold, 0, ONE16 * 3 / 2);
     D.gain16 = tabi(BT_GAIN, 65, q16); D.wet16 = tabi(BT_WET, 65, q16); D.chr16 = tabi(BT_CHR, 65, q16);
     D.hump16 = tabi(BT_HUMP, 65, q16); D.low16 = tabi(BT_LOW, 65, q16); D.sub16 = tabi(BT_SUB, 65, q16);
     D.comp16b = tabi(BT_COMP, 65, q16); D.post16 = tabi(BT_POST, 65, q16);
     svfb_set(&D.cab, tabi(BT_CABC, 65, q16));
     if (D.md_hpf) svf_set(&D.riseHP, CI_120 + (D.md_hpf - 120) * 64 / 400);
     /* pitch */
+    eng = D.eng = clampi(P.eng, 0, NENG - 1);
+    acid = eng == E_ACID || eng == E_SCREAM;
     {
         int32_t nn8 = D.note8 + D.md_pitch8;
         D.inc = pitch_inc(nn8, 1); D.incS = D.inc >> 1;
-        D.invdt = (uint32_t)(0x80000000u / ((D.inc >> 12) ? (D.inc >> 12) : 1u));
+        D.invdt = inv_of(D.inc);
         D.sqHP.G = G_OS_T[clampi(nn8 / 48 - 211, 0, 704)];
         D.foldComp16 = nn8 > (48 << 8) ? exp2_16(-((nn8 - (48 << 8)) * 33722 / 3072)) : ONE16;  /* 0.7^(oct) */
+        kt = (eng == E_SCREAM ? ONE16 / 2 : 0);
+        if (eng == E_REESE) {   /* the side saws: -13 / +11 cents x (0.25 + DETUNE), and the drift */
+            int32_t det = ONE16 / 4 + P.chr;
+            D.inc2 = (uint32_t)(((uint64_t)D.inc * (uint32_t)exp2_16(m16(det, -13 * ONE16 / 1200) + D.drift)) >> 16);
+            D.inc3 = (uint32_t)(((uint64_t)D.inc * (uint32_t)exp2_16(m16(det, 11 * ONE16 / 1200) - m16(D.drift, ONE16 * 7 / 10))) >> 16);
+            D.inv2 = inv_of(D.inc2); D.inv3 = inv_of(D.inc3);
+        } else if (eng == E_SCREAM) {   /* two saws, +14 / -7 cents, each into its own ladder */
+            D.inc2 = (uint32_t)(((uint64_t)D.inc * 66066u) >> 16); D.inc3 = (uint32_t)(((uint64_t)D.inc * 65271u) >> 16);
+            D.inv2 = inv_of(D.inc2); D.inv3 = inv_of(D.inc3);
+        } else if (eng == E_GROWL) {   /* FM: ratio, index from the envelope, less up high (0.75 an octave above C3) */
+            int32_t I16 = m16(ONE16 * 6 / 10 + m16(ONE16 * 29 / 10, D.idx >> 8), ONE16 * 3 / 10 + P.chr);
+            if (nn8 > (48 << 8)) I16 = m16(I16, exp2_16(-((nn8 - (48 << 8)) * 27199 / 3072)));
+            D.incM = D.inc * (uint32_t)clampi(P.ratio, 1, 4);
+            D.fmI24 = m16(I16, 2670177);               /* I / 2 pi, Q24 */
+        }
     }
     /* cutoff (index: 1/64 octave above 20 Hz) */
     EM = P.env;
     cut = P.cut;
-    c16 = (250 << 16) + 192 * cut - m16(EM, 83 << 16) + m16(m16(m16(EM, 352 << 16), D.envF >> 8), ONE16 + D.wow)
-        + m16(m16(P.acc, D.accCap >> 8), 141 << 16) + D.mod_oct16 * 64 + D.md_cut16 * 1 + D.roll_cut16 * 64 + D.vary_c16;
+    if (acid)
+        c16 = (250 << 16) + 192 * cut - m16(EM, 83 << 16) + m16(m16(m16(EM, 352 << 16), D.envF >> 8), ONE16 + D.wow)
+            + m16(m16(P.acc, D.accCap >> 8), 141 << 16);
+    else
+        c16 = (64 << 16) + 544 * cut + m16(m16(m16(EM, 384 << 16), D.envF >> 8), ONE16 + D.wow) + m16(m16(P.acc, D.accCap >> 8), 85 << 16);
+    c16 += D.mod_oct16 * 64 + D.md_cut16 * 1 + D.roll_cut16 * 64 + D.vary_c16 + m16(kt, (D.note8 - (48 << 8)) * 1365);
     c16 = clampi(c16, 0, 638 << 16);
     s_fcidx = c16 >> 16;
-    D.G = tabi(G_OS_T, 705, c16);
-    D.G2 = m30(D.G, D.G); D.G3 = m30(D.G2, D.G); D.G4 = m30(D.G2, D.G2); D.om = (1 << 30) - D.G;
-    res = clampi(P.res + D.md_res16, 0, ONE16 * 95 / 100);
-    k24 = res * 256 * 4;                                    /* k = 4 res, Q24 */
-    D.k24 = k24;
-    D.comp16 = LCOMP_T[clampi(k24 >> 18, 0, 320)];
-    {   /* 1 / (1 + k a G^4) */
-        int32_t den16 = ONE16 + (int32_t)(((int64_t)m30(D.a_hp, D.G4) * k24) >> 38);
-        D.recip = (int32_t)((0x40000000u / (uint32_t)den16) << 16);
+    res = clampi(P.res + D.md_res16, 0, eng == E_SCREAM ? ONE16 * 99 / 100 : ONE16 * 95 / 100);
+    k24 = res * 256 * (eng == E_SCREAM ? 5 : 4);            /* k = 4 res (SCREAM 5), Q24 */
+    if (eng == E_GROWL) {   /* resonant SVF, k = 2 - 1.95 res */
+        int32_t g16 = tabi(TAN_OS_T, 705, c16), k16 = 2 * ONE16 - m16(res, ONE16 * 195 / 100);
+        int32_t dn16 = ONE16 + m16(g16, g16 + k16), a1 = (int32_t)((0x40000000u / (uint32_t)dn16) << 16);
+        D.gsvf.a1 = a1; D.gsvf.a2 = (int32_t)(((int64_t)a1 * g16) >> 16); D.gsvf.a3 = (int32_t)(((int64_t)D.gsvf.a2 * g16) >> 16);
+        /* the formant combs: 730 -> 570 and 1090 -> 840 Hz, swept by an LFO on the eighths */
+        {
+            int32_t ph = ONE16 / 2 + (sin24(D.formPh) >> 9), f1 = lerp16(730, 570, ph), f2 = lerp16(1090, 840, ph);
+            D.cda8 = (int32_t)((FO << 8) / (uint32_t)f1); D.cdb8 = (int32_t)((FO << 8) / (uint32_t)f2);
+        }
+    } else {
+        lad_coef(&D.lc, c16, k24, G_OS_T[eng == E_SCREAM ? CI_40 : CI_150]);
+        if (eng == E_SCREAM) lad_coef(&D.lc2, clampi(c16 + m16(P.chr, 54 << 16), 0, 638 << 16), k24, G_OS_T[CI_40]);
     }
+    D.formPh += (uint32_t)clampi(P.bpm10, 600, 2000) * 325u * 16u;   /* 2 x bpm / 60 Hz, 16 samples a tick */
     /* envelopes */
-    D.kF = D.acc ? KF_ACC : KF_ACID_T[clampi((m16(P.dec, 255 << 16) >> 16) + (P.vary > 0 ? (D.vary_c16 >> 16) / 2 : 0), 0, 255)];
+    {
+        int32_t di = (m16(P.dec, 255 << 16) >> 16) + (P.vary > 0 ? (D.vary_c16 >> 16) / 2 : 0);
+        D.kF = D.acc && acid ? KF_ACC : acid ? KF_ACID_T[clampi(di, 0, 255)] : KF_WIDE_T[clampi(di, 0, 255)];
+        D.kIdx = K_IDX_T[clampi(P.dec >> 10, 0, 63)];
+        D.kRel = K_REL_T[clampi((P.rel - 1) * 63 / 199, 0, 63)];
+    }
     D.kGlide = K_GLIDE_T[clampi(P.glide >> 10, 0, 63)];
     D.kCapC = K_CAPC_T[clampi(res >> 10, 0, 63)]; D.kCapD = K_CAPD_T[clampi(res >> 10, 0, 63)];
     D.kKick = K_KICK_T[32]; D.kDuck = K_DUCK_T[clampi(P.duck >> 10, 0, 63)];
@@ -849,12 +954,47 @@ HOT_FN void c1_job(uint32_t b)
         hi = m16(hi, B->rg[i]);
         /* the low band: second LP stage, the sub */
         low = m16(m16(svf_lp(&S2.xl2, B->l1[i]), G->low16) + B->sub[i], G->msub16);
+        if (G->rmb > 0) {   /* RUMBLE: the low band, a little of the high and the kick through four diffusers, fed back */
+            int32_t xin = low + m16(hi, ONE16 * 3 / 10) + (S2.kout >> 1) + S2.rfb, k;
+            for (k = 0; k < 4; k++) {
+                uint32_t n = (uint32_t)(RMB_AT[k + 1] - RMB_AT[k]), pp = S2.rp[k];
+                int32_t d = (int32_t)rmb[RMB_AT[k] + pp] * 512, w = xin + m16(d, ONE16 * 6 / 10);
+                rmb[RMB_AT[k] + pp] = (int16_t)clampi(w >> 9, -32767, 32767);
+                xin = d - m16(w, ONE16 * 6 / 10);
+                S2.rp[k] = pp + 1u == n ? 0u : pp + 1u;
+            }
+            S2.rfb = tanh24(m16(op_lp(&S2.rLP, xin), ONE16 * 82 / 100 + m16(G->rmb, ONE16 / 10)));
+            low += m16(S2.rfb, m16(G->rmb, ONE16 * 9 / 10));
+        }
         low = m16(tanh24(m16(low, 92560)), 46396);           /* 0.708 tanh(low / 0.708) */
+        if (G->harm > 0) {   /* the low band's harmonics, for small speakers: 160 Hz HP, 700 Hz LP of tanh(6 low) */
+            int32_t hg = op_lp(&S2.hLP, svf_hp(&S2.hHP1, tanh24(low * 6)));
+            low += m16(hg, m16(G->harm, ONE16 * 45 / 100));
+        }
         /* crush: BURST above .85 or SHRED */
         if (G->crdiv > 1 || G->crbits < 16) {
             int32_t sh2 = 24 - (G->crbits - 1);
             if (++S2.crush_acc >= G->crdiv) { S2.crush_acc = 0; S2.crush_hold = (int32_t)((uint32_t)(hi >> sh2) << sh2); }
             S2.crush_lp += (S2.crush_hold - S2.crush_lp) * 3 / 4; hi = S2.crush_lp;
+        }
+        {   /* FREEZE: the high band recorded at half rate, all the time; a loop of it played over the live one */
+            int32_t fz = 0;
+            if (G->frz_ev == 1 && (i & 15u) == 0) {
+                uint32_t n2 = (uint32_t)G->frz_len >> 1;
+                S2.flen = n2 < 2u ? 2u : n2; S2.fstart = (S2.fw + FRZ_N - S2.flen) % FRZ_N; S2.fpos = 0; S2.fon = 1; S2.fgain = ONE24;
+            }
+            if (G->frz_ev == 2 && (i & 15u) == 0) S2.fon = 2;   /* landed: fade */
+            if (i & 1u) { frz[S2.fw] = (int16_t)clampi((S2.facc + (hi >> 1)) >> 9, -32767, 32767); S2.fw = S2.fw + 1u == FRZ_N ? 0u : S2.fw + 1u; }
+            else S2.facc = hi >> 1;
+            if (S2.fon) {
+                uint32_t a = (S2.fstart + (S2.fpos >> 1)) % FRZ_N, b2 = (a + 1u) % FRZ_N;
+                int32_t v = (int32_t)frz[a] * 512;
+                if (S2.fpos & 1u) v = (v + (int32_t)frz[b2] * 512) >> 1;
+                fz = m16(m24(v, S2.fgain), G->frz_mix);
+                S2.fpos = S2.fpos + 1u >= 2u * S2.flen ? 0u : S2.fpos + 1u;
+                if (S2.fon == 2) { S2.fgain = m30(S2.fgain, G->frz_fade); if (S2.fgain < 4096) S2.fon = 0; }
+                hi = m16(hi, S2.fon == 1 ? G->frz_dry : ONE16) + fz;
+            }
         }
         /* void: dry and sub out over 20 ms */
         S2.void_mute += (G->void_tgt - S2.void_mute) / 600;
@@ -889,19 +1029,20 @@ HOT_FN void c1_job(uint32_t b)
         S2.noise = S2.noise * 1103515245u + 12345u;
         kick = m24(sin24(S2.kPh), m16(S2.kEnv, 72090)) + m16(m24((int32_t)S2.noise >> 7, S2.click), ONE16 / 4);
         kick = tanh24(m16(kick, 91750));
+        S2.kout = kick;
         S2.hEnv = m30(S2.hEnv, K_HAT);
         hat = m16(m24(op_hp(&S2.hHP, (int32_t)S2.noise >> 7), S2.hEnv), ONE16 * 35 / 100);
         if (B->drums && B->playing) { L += m16(kick + m16(hat, ONE16 * 8 / 10), B->drum_lvl); R += m16(kick + m16(hat, ONE16 * 11 / 10), B->drum_lvl); }
         /* DC block */
         { int32_t a = L - S2.dcx + m30(S2.dcy, 1072235000), c = R - S2.dcxr + m30(S2.dcyr, 1072235000); S2.dcx = L; S2.dcy = a; S2.dcxr = R; S2.dcyr = c; L = a; R = c; }
         /* tape stop (mono varispeed) */
-        tape[S2.tw] = (int16_t)clampi((L + R) >> 10, -32767, 32767);
+        if (i & 1u) { tape[S2.tw] = (int16_t)clampi((S2.tacc + ((L + R) >> 1)) >> 10, -32767, 32767); S2.tw = S2.tw + 1u == TAPE_N ? 0u : S2.tw + 1u; }
+        else S2.tacc = (L + R) >> 1;
         if (G->tm == 1 && !S2.tm_prev) S2.tr16 = S2.tw << 16;   /* engaged: the head starts where the tape is now */
         S2.tm_prev = G->tm;
-        S2.tw = S2.tw + 1u == TAPE_N ? 0u : S2.tw + 1u;
         if (G->tm == 1) {
             uint32_t ti, t2; int32_t tv, g8, tr = G->tr;
-            S2.tr16 += (uint32_t)tr;
+            S2.tr16 += (uint32_t)tr >> 1;                  /* (half-rate positions) */
             if ((S2.tr16 >> 16) >= TAPE_N) S2.tr16 -= TAPE_N << 16;
             ti = S2.tr16 >> 16; t2 = ti + 1u == TAPE_N ? 0u : ti + 1u;
             tv = ((int32_t)tape[ti] * 512) + m16(((int32_t)tape[t2] - tape[ti]) * 512, (int32_t)(S2.tr16 & 0xFFFFu));
@@ -1057,55 +1198,75 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
             G->dt8 = D.dtime16; G->fb = D.dlyfb; G->vlp = D.th[T_VOID].st ? D.void_lp : -1;
             G->tr = D.tape_rate16; G->tm = (uint8_t)D.tape_mode; G->rmsIn = D.rmsIn;
             G->a1 = D.cab.a1; G->a2 = D.cab.a2; G->a3 = D.cab.a3;
+            G->rmb = D.eng == E_RUMBLE ? P.chr : 0; G->harm = P.harm;
+            G->frz_ev = D.frz_ev; G->frz_len = D.frz_len; D.frz_ev = 0;
+            G->frz_mix = m16(P.tp[T_FREEZE][1], ONE16 * 12 / 10) + ONE16 * 4 / 10; G->frz_dry = clampi(P.tp[T_FREEZE][2] * 2, 0, ONE16);
+            G->frz_fade = (1 << 30) - (int32_t)((1u << 30) / (uint32_t)(4410 + m16(P.tp[T_FREEZE][3], 84000)));   /* 0.1 .. 2 s */
         }
 
         /* ---- envelopes (base rate) */
         if (D.att) { D.envF += ATT_F_STEP; if (D.envF >= ONE24) { D.envF = ONE24; D.att = 0; } } else D.envF = m30(D.envF, D.kF);
         if (D.gate) { if (D.ampAtt) { D.amp += ATT_A_STEP; if (D.amp >= ONE24) { D.amp = ONE24; D.ampAtt = 0; } } else D.amp = m30(D.amp, K_AMPHOLD); }
-        else { D.amp = m30(D.amp, K_REL_T[2]); D.ampAtt = 0; }
+        else { D.amp = m30(D.amp, D.kRel); D.ampAtt = 0; }
         D.accEnv = m30(D.accEnv, K_ACCENV);
         D.accCap += m30(D.accEnv - D.accCap, D.accEnv > D.accCap ? D.kCapC : D.kCapD);
         D.wow = m30(D.wow, 1073698000);
         D.note8 = D.tgt8 + m30(D.note8 - D.tgt8, D.kGlide);
         D.vca = D.acc ? m16(D.amp, ONE16 + m16(P.acc, ONE16 * 9 / 10)) : D.amp;
 
+        if (D.eng == E_GROWL) D.idx = m30(D.idx, D.kIdx);
+        else if (D.eng == E_REESE) { D.noise = D.noise * 1103515245u + 12345u; D.drift += (((int32_t)(D.noise >> 22) - 512) >> 4) - (D.drift >> 13); D.drift = clampi(D.drift, -ONE16 / 400, ONE16 / 400); }
+
         /* ---- 2x oversampled core */
         for (o = 0; o < 2u; o++) {
-            int32_t x, y, s, u, v, y1, y2, y3, y4, hiS, h, hg, sh;
+            int32_t x, x2 = 0, y, s, hiS, h, hg, sh, par = 0;
             uint32_t ph, dt = D.inc;
             D.ph += dt;
             ph = D.ph;
-            s = (int32_t)(ph >> 7) - ONE24;                 /* saw, Q24 */
-            if (ph < dt) { u = (int32_t)(((uint64_t)(ph >> 12) * D.invdt) >> 7); s += m24(ONE24 - u, ONE24 - u); }
-            else if ((uint32_t)-ph < dt) { u = (int32_t)(((uint64_t)((uint32_t)-ph >> 12) * D.invdt) >> 7); s -= m24(ONE24 - u, ONE24 - u); }
-            s += m16(m24(s, s) - ONE24 / 3, 5243);           /* + 0.08 (s^2 - 1/3) */
-            x = s;
-            if (P.wave > 0) {
-                uint32_t pw = 2018634629u, p2 = ph - pw;    /* 0.47 */
-                int32_t pu = ph < pw ? ONE24 : -ONE24;
-                if (ph < dt) { u = (int32_t)(((uint64_t)(ph >> 12) * D.invdt) >> 7); pu -= m24(ONE24 - u, ONE24 - u); }
-                else if ((uint32_t)-ph < dt) { u = (int32_t)(((uint64_t)((uint32_t)-ph >> 12) * D.invdt) >> 7); pu += m24(ONE24 - u, ONE24 - u); }
-                if (p2 < dt) { u = (int32_t)(((uint64_t)(p2 >> 12) * D.invdt) >> 7); pu += m24(ONE24 - u, ONE24 - u); }
-                else if ((uint32_t)-p2 < dt) { u = (int32_t)(((uint64_t)((uint32_t)-p2 >> 12) * D.invdt) >> 7); pu -= m24(ONE24 - u, ONE24 - u); }
-                pu = m16(op_lp(&D.sqLP, op_hp(&D.sqHP, pu)), ONE16 * 104 / 100);
-                x = lerp16(s, pu, P.wave);
+            switch (D.eng) {
+            default:                                    /* ACID (and SCREAM's first saw) */
+                s = saw24(ph, dt, D.invdt);
+                s += m16(m24(s, s) - ONE24 / 3, 5243);       /* + 0.08 (s^2 - 1/3) */
+                x = s;
+                if (D.eng == E_ACID && P.chr > 0) {
+                    uint32_t pw = 2018634629u, p2 = ph - pw;    /* 0.47 */
+                    int32_t pu = (ph < pw ? ONE24 : -ONE24) - blep(ph, dt, D.invdt) + blep(p2, dt, D.invdt);
+                    pu = m16(op_lp(&D.sqLP, op_hp(&D.sqHP, pu)), ONE16 * 104 / 100);
+                    x = lerp16(s, pu, P.chr);
+                }
+                if (D.eng == E_SCREAM) {
+                    D.ph2 += D.inc2; D.ph3 += D.inc3;
+                    x = saw24(D.ph3, D.inc3, D.inv3); x2 = saw24(D.ph2, D.inc2, D.inv2);
+                }
+                break;
+            case E_RUMBLE:                              /* sine + a little triangle */
+                x = sin24(ph) + m16((int32_t)((ph >> 31) ? ~ph : ph) >> 6, ONE16 * 15 / 100) - ONE24 * 15 / 100;
+                break;
+            case E_REESE: {                             /* the centre saw + the two detuned ones, their lows cut */
+                int32_t side;
+                D.ph2 += D.inc2; D.ph3 += D.inc3;
+                side = op_hp(&D.rHP2, op_hp(&D.rHP1, saw24(D.ph2, D.inc2, D.inv2) + saw24(D.ph3, D.inc3, D.inv3)));
+                x = m16(saw24(ph, dt, D.invdt) + side, ONE16 * 62 / 100);
+                break;
+            }
+            case E_GROWL: {                             /* 2-op FM + a little saw */
+                uint32_t pm;
+                D.phM += D.incM;
+                pm = ph + (uint32_t)(((int64_t)D.fmI24 * sin24(D.phM)) >> 16);
+                x = m16(sin24(pm), ONE16 * 85 / 100) + m16(saw24(ph, dt, D.invdt), ONE16 * 3 / 10);
+                break;
+            }
             }
             if (D.md_noise) { D.noise = D.noise * 1103515245u + 12345u; x += m16((int32_t)D.noise >> 7, D.md_noise); }
             /* pre drive (asymmetric) */
-            if (D.preG > ONE16 * 102 / 100 || D.bias) x = op_hp(&D.preHP, tanh24(m16(x, D.preG) + D.bias) - D.tbias);
-            /* ladder: ZDF solve with the HP in the loop, saturation at the loop input */
-            {
-                int32_t S = m30(m30(D.s0, D.G3) + m30(D.s1, D.G2) + m30(D.s2, D.G) + D.s3, D.om);
-                int32_t b = -m30(D.hs, D.a_hp), fb = m30(S, D.a_hp) + b;
-                u = m30(x - m24(fb, D.k24), D.recip);
-                u = m16(tanh24(m16(u, 98304)), 43691);
-                v = m30(u - D.s0, D.G); y1 = v + D.s0; D.s0 = y1 + v;
-                v = m30(y1 - D.s1, D.G); y2 = v + D.s1; D.s1 = y2 + v;
-                v = m30(y2 - D.s2, D.G); y3 = v + D.s2; D.s2 = y3 + v;
-                v = m30(y3 - D.s3, D.G); y4 = v + D.s3; D.s3 = y4 + v;
-                v = m30(y4 - D.hs, D.hG); D.hs = v + D.hs + v;
-                y = m16(y4 + m16(y3 - y4, 9830), D.comp16);
+            if (D.preG > ONE16 * 102 / 100 || D.bias) {
+                x = op_hp(&D.preHP, tanh24(m16(x, D.preG) + D.bias) - D.tbias);
+                if (D.eng == E_SCREAM) x2 = tanh24(m16(x2, D.preG) + D.bias) - D.tbias;
             }
+            /* the filter */
+            if (D.eng == E_GROWL) { int32_t lp, bp; svf_run(&D.gsvf, x, &lp, &bp); y = m16(lp, ONE16 * 12 / 10); }
+            else if (D.eng == E_SCREAM) y = m16(lad_run(&D.lad, &D.lc, x) + lad_run(&D.lad2, &D.lc2, x2), ONE16 * 62 / 100);
+            else y = lad_run(&D.lad, &D.lc, x);
             y = m24(y, D.vca);
             /* fold */
             {
@@ -1116,6 +1277,20 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
                     y = lerp16(y, m16(sin24((uint32_t)z << 6), ONE16 * 9 / 10), clampi(m16(fa, ONE16 * 14 / 10), 0, ONE16));
                 }
             }
+            if (D.eng == E_GROWL && P.formant > 0) {   /* two formant combs */
+                int32_t ca, cb, k;
+                uint32_t ra, rb, fa_, fb_;
+                ra = (D.cp - (uint32_t)(D.cda8 >> 8)) & 255u; fa_ = (uint32_t)(D.cda8 & 255) << 8;
+                rb = (D.cp - (uint32_t)(D.cdb8 >> 8)) & 255u; fb_ = (uint32_t)(D.cdb8 & 255) << 8;
+                ca = D.cA[ra] + m16(D.cA[(ra - 1u) & 255u] - D.cA[ra], (int32_t)fa_);
+                cb = D.cB[rb] + m16(D.cB[(rb - 1u) & 255u] - D.cB[rb], (int32_t)fb_);
+                D.clpA += m16(ca - D.clpA, ONE16 / 5); D.clpB += m16(cb - D.clpB, ONE16 / 5);
+                D.cA[D.cp] = y + m16(D.clpA, ONE16 * 3 / 4); D.cB[D.cp] = y + m16(D.clpB, ONE16 * 3 / 4);
+                D.cp = (D.cp + 1u) & 255u;
+                k = m16(y, ONE16 / 2) + m16(ca + cb, ONE16 * 35 / 100);
+                y = lerp16(y, clampi(k, -8 * ONE24, 8 * ONE24), P.formant);
+            }
+            if (D.eng == E_RUMBLE) { int32_t lp, bp; svf_run(&D.bp700, tanh24(y * 3), &lp, &bp); par = m16(m16(bp, BP700_K16), ONE16 / 10); }
             /* split at 120 Hz (Linkwitz-Riley 4): the first stage here, the low band's second stage at the base rate
              * (its first LP stage is 90 dB down at the OS Nyquist: summing the two samples is all the decimation needs) */
             {
@@ -1123,7 +1298,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
                 svf_run(&D.xl1, y, &l1, &b1);
                 h1 = y - m30(b1, K_BW_Q30) - l1;
                 D.l1sum += l1 >> 1;
-                hiS = svf_hp(&D.xh2, h1);
+                hiS = svf_hp(&D.xh2, h1) + par;
             }
             if (D.md_hpf) hiS = svf_hp(&D.riseHP, hiS);
             if (o) D.rmsIn += (m24(hiS, hiS) - D.rmsIn) >> 13;
@@ -1169,12 +1344,15 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
 
 static void dsp_init(void)
 {
-    D.hG = G_OS_T[CI_150]; D.a_hp = (1 << 30) - D.hG;
+    D.rHP1.G = D.rHP2.G = G_OS_T[CI_120];
+    D.bp700.a1 = BP700_A1; D.bp700.a2 = BP700_A2; D.bp700.a3 = BP700_A3;
+    lad_coef(&D.lc, 300 << 16, 0, G_OS_T[CI_150]); D.lc2 = D.lc;
     D.preHP.G = G_OS_T[CI_20]; D.sqLP.G = G_OS_T[CI_9K]; D.hump.G = G_OS_T[CI_720];
     svf_set(&D.xl1, CI_120); svf_set(&D.xh2, CI_120); svf_set(&D.riseHP, CI_120); svfb_set(&D.cab, 704);
     svfb_set(&S2.xl2, CI_120); svfb_set(&S2.hhp, CI_100); svfb_set(&S2.cab, 704);
     S2.hHP.G = G_BR_T[CI_7K];
     S2.dly[0].G = S2.dly[2].G = G_BR_T[CI_250]; S2.dly[1].G = S2.dly[3].G = G_BR_T[CI_3K2];
+    svfb_set(&S2.hHP1, CI_160); S2.hLP.G = G_BR_T[CI_700]; S2.rLP.G = G_BR_T[CI_140];
     S2.noise = 33333; S2.kF8 = 31 << 8; S2.kInc = pitch_inc(S2.kF8, 0); S2.corr16 = ONE16; S2.void_mute = ONE16;
     D.void_tgt = ONE16; D.void_lp = 640; D.tape_rate16 = ONE16;
     D.roll_gate_env = ONE16; D.roll_gate_on = 1 << 30; D.roll_idx = -1; D.shred_div = 1; D.shred_bits = 16;
@@ -1211,7 +1389,8 @@ static struct {
     /* drawing caches */
     uint32_t drawn_hash[8]; uint32_t last_frame; int drop_flash, acc_flash, roll_flash, beat_flash, msg_t; const char *msg;
     int last_note; uint32_t last_step_ri; uint32_t clk_sent;
-    int light, light_set; uint32_t cpu_pk, c1_pk, pk_t;   /* key backlight 0..3; CPU peaks (us a block) */
+    int light, light_set; uint32_t cpu_pk, c1_pk, pk_t, sel_t, dice_n;
+    int32_t dice_mem[16]; int has_dice;   /* the sound before the last dice */   /* key backlight 0..3; CPU peaks (us a block) */
     int lastcc[8];
     int32_t snap[4];
 } U;
@@ -1280,10 +1459,48 @@ static void load_preset(int i)
 {
     const preset_t *p = &PRESETS[(i + (int)NPRESET) % (int)NPRESET];
     U.preset = (i + (int)NPRESET) % (int)NPRESET;
-    P.cut = p->cut; P.res = p->res; P.env = p->env; P.dec = p->dec; P.acc = p->acc; P.burst = p->burst; P.wave = p->wave;
+    P.cut = p->cut; P.res = p->res; P.env = p->env; P.dec = p->dec; P.acc = p->acc; P.burst = p->burst; P.chr = p->chr;
     P.dly_send = p->dly_send; P.dly_fb = p->dly_fb; P.dly_time = p->dly_time; P.sub = p->sub; P.drive = p->drive;
+    P.duck = p->duck; P.fold = p->fold; P.formant = p->formant; P.ratio = p->ratio; P.rel = p->rel; P.eng = p->eng;
     U.snap[0] = P.cut; U.snap[1] = P.res; U.snap[2] = P.env; U.snap[3] = P.burst;
     U.dirty_all = 1;
+}
+
+/* the sound dice: a new voice for the engine, inside the ranges that engine sounds good in */
+static volatile int32_t *const DICE_P[16] = {&P.cut, &P.res, &P.env, &P.dec, &P.acc, &P.burst, &P.chr, &P.drive, &P.sub,
+                                              &P.fold, &P.formant, &P.ratio, &P.rel, &P.glide, &P.dly_send, &P.eng};
+static void dice(void)
+{
+    static const uint8_t RNG[NENG][9][2] = {   /* cut res env dec acc burst chr drive sub, in percent */
+        {{20, 60}, {45, 90}, {30, 85}, {15, 65}, {40, 100}, {10, 85}, {0, 100}, {0, 40}, {0, 30}},
+        {{8, 35}, {10, 40}, {10, 45}, {30, 70}, {30, 70}, {20, 70}, {40, 95}, {30, 80}, {20, 60}},
+        {{30, 70}, {5, 35}, {20, 60}, {25, 65}, {40, 70}, {35, 95}, {25, 95}, {0, 30}, {30, 60}},
+        {{35, 75}, {20, 60}, {25, 65}, {20, 50}, {40, 80}, {40, 90}, {35, 95}, {0, 30}, {0, 30}},
+        {{25, 60}, {75, 97}, {40, 85}, {20, 60}, {60, 100}, {50, 95}, {20, 90}, {0, 25}, {0, 20}},
+    };
+    uint32_t h = hash32(fm1_ms * 2654435761u ^ (U.dice_n++ * 40503u)), k, e = (uint32_t)clampi(P.eng, 0, NENG - 1);
+    for (k = 0; k < 16; k++) U.dice_mem[k] = *DICE_P[k];
+    U.has_dice = 1;
+    for (k = 0; k < 9; k++) {
+        uint32_t lo = RNG[e][k][0], hi = RNG[e][k][1], r;
+        h = hash32(h + k * 0x9E3779B9u); r = h >> 16;
+        *DICE_P[k] = clampi((int32_t)((lo * 65536u + (hi - lo) * r) / 100u), 0, 65535);
+    }
+    if (e == E_ACID) { h = hash32(h); P.chr = (h & 3u) == 0 ? ONE16 - 1 : (h & 3u) == 1 ? P.chr : 0; }   /* saw or square, mostly */
+    h = hash32(h); P.fold = e == E_GROWL ? (int32_t)((h >> 16) * 6 / 10) : 0;
+    h = hash32(h); P.formant = e == E_GROWL ? ONE16 * 3 / 10 + (int32_t)((h >> 16) * 6 / 10) : 0;
+    h = hash32(h); P.ratio = e == E_GROWL ? 1 + (int32_t)(h >> 30 > 2 ? 2 : h >> 30) : 2;
+    P.rel = e == E_REESE ? 80 : e == E_RUMBLE ? 30 : e == E_GROWL ? 20 : 8;
+    U.snap[0] = P.cut; U.snap[1] = P.res; U.snap[2] = P.env; U.snap[3] = P.burst;
+    say("DICE");
+}
+static void dice_undo(void)
+{
+    uint32_t k;
+    if (!U.has_dice) return;
+    for (k = 0; k < 16; k++) *DICE_P[k] = U.dice_mem[k];
+    U.has_dice = 0;
+    say("UNDO DICE");
 }
 
 /* settings: the sound + 8 pattern DNAs (regenerated on boot) */
@@ -1293,14 +1510,20 @@ typedef struct {
     uint8_t dly_time, lock, pad[2];
     uint16_t bpm10, swing;
     struct { uint32_t seed; int32_t gen; uint8_t type, dens, slide, acc, root, scale, pad[2]; } slot[8];
+    /* v4 (0.2) */
+    uint8_t eng, ratio, rel, light;
+    uint16_t fold, formant, harm, pad4;
 } save_t;
+#define SAVE_V3_N ((uint32_t)__builtin_offsetof(save_t, eng))   /* 0.1's settings: the same fields, up to here */
 static save_t SV;
 static void settings_store(void)
 {
-    SV.ver = 3; SV.preset = (uint8_t)U.preset; SV.pat = (uint8_t)U.pat; SV.drums = (uint8_t)P.drums;
+    SV.ver = 4; SV.eng = (uint8_t)P.eng; SV.ratio = (uint8_t)P.ratio; SV.rel = (uint8_t)P.rel; SV.light = (uint8_t)(U.light + 1);
+    SV.fold = (uint16_t)clampi(P.fold, 0, 65535); SV.formant = (uint16_t)clampi(P.formant, 0, 65535); SV.harm = (uint16_t)clampi(P.harm, 0, 65535);
+    SV.preset = (uint8_t)U.preset; SV.pat = (uint8_t)U.pat; SV.drums = (uint8_t)P.drums;
     SV.cut = (uint16_t)clampi(P.cut, 0, 65535); SV.res = (uint16_t)clampi(P.res, 0, 65535); SV.env = (uint16_t)clampi(P.env, 0, 65535);
     SV.dec = (uint16_t)clampi(P.dec, 0, 65535); SV.acc = (uint16_t)clampi(P.acc, 0, 65535); SV.burst = (uint16_t)clampi(P.burst, 0, 65535);
-    SV.wave = (uint16_t)clampi(P.wave, 0, 65535); SV.glide = (uint16_t)clampi(P.glide, 0, 65535); SV.sub = (uint16_t)clampi(P.sub, 0, 65535);
+    SV.wave = (uint16_t)clampi(P.chr, 0, 65535); SV.glide = (uint16_t)clampi(P.glide, 0, 65535); SV.sub = (uint16_t)clampi(P.sub, 0, 65535);
     SV.drive = (uint16_t)clampi(P.drive, 0, 65535); SV.dly_send = (uint16_t)clampi(P.dly_send, 0, 65535); SV.dly_fb = (uint16_t)clampi(P.dly_fb, 0, 65535);
     SV.duck = (uint16_t)clampi(P.duck, 0, 65535); SV.vol = (uint16_t)clampi(P.vol, 0, 65535);
     SV.dly_time = (uint8_t)P.dly_time; SV.lock = (uint8_t)P.lock; SV.bpm10 = (uint16_t)P.bpm10; SV.swing = (uint16_t)P.swing;
@@ -1330,7 +1553,7 @@ static void top_bar(void)
     glyph_draw(GLYPH_LIE16, 16, 6, 4, C_HEAT);
     cv_text(26, 4, &FONT_S, "RIFT", C_HEAT);
     cv_rect(70, 4, 72, 17, U.page == PG_SEQ ? C_HEAT : C_ACID);
-    cv_text(74, 4, &FONT_S, U.page == PG_SEQ ? (U.seqmode ? "SEQ PERF" : "SEQ GEN") : U.page == PG_VOICE ? "VOICE" : U.page == PG_FX ? "FX" : "ACID", C_BLACK);
+    cv_text(74, 4, &FONT_S, U.page == PG_SEQ ? (U.seqmode ? "SEQ PERF" : "SEQ GEN") : U.page == PG_VOICE ? "VOICE" : U.page == PG_FX ? "FX" : ENG_NAME[clampi(P.eng, 0, NENG - 1)], C_BLACK);
     num_str(b, P.bpm10 / 10);
     cv_text(196 - text_w(&FONT_S, b), 4, &FONT_S, b, C_INK);
     cv_rect(0, 23, 240, 1, C_LN);
@@ -1496,6 +1719,7 @@ static void draw_info_page(void)
     if (U.page == PG_VOICE) {
         int32_t x, prev = 0, fci = s_fcidx;
         cv_text(4, 0, &FONT_S, PRESETS[U.preset].name, C_ACID);
+        cv_text(170, 0, &FONT_S, ENG_NAME[clampi(P.eng, 0, NENG - 1)], C_MUTE);
         for (x = 0; x < 240; x += 2) {   /* the ladder's response, drawn from the cutoff index (approximate) */
             int32_t c = x * 640 / 240, d = c - fci, db = d < 0 ? 0 : -(d * 24 / 64), pk = P.res * 12 >> 16, y;
             if (iabs(d) < 16) db += pk * (16 - iabs(d)) / 16;
@@ -1504,7 +1728,11 @@ static void draw_info_page(void)
             prev = y;
         }
         cv_rect(clampi(fci * 240 / 640, 0, 239), 20, 1, 100, C_ACID);
-        cv_text(4, 104, &FONT_S, "DIODE LADDER 2X", C_MUTE);
+        {
+            static const char *const ED[NENG] = {"DIODE LADDER 2X", "SINE + DIFFUSER", "3 SAWS DETUNED", "FM + FORMANTS", "TWIN LADDER"};
+            cv_text(4, 104, &FONT_S, ED[clampi(P.eng, 0, NENG - 1)], C_MUTE);
+            cv_text(150, 104, &FONT_S, "SEL DICE", C_DIMC);
+        }
     } else {
         int t;
         cv_text(4, 0, &FONT_S, "DELAY", C_MUTE);
@@ -1512,7 +1740,7 @@ static void draw_info_page(void)
         for (t = 0; t < 8; t++) {
             int32_t x = 4 + (t % 4) * 59, y = 22 + (t / 4) * 40;
             cv_rect(x, y, 55, 34, s_th[t] >= 2 ? C_HEAT : s_th[t] ? C_HEATD : RGB(22, 22, 26));
-            cv_text(x + 4, y + 9, &FONT_S, TH_NAME[t], t == T_FREEZE ? C_DIMC : s_th[t] >= 2 ? C_BLACK : C_INK);
+            cv_text(x + 4, y + 9, &FONT_S, TH_NAME[t], s_th[t] >= 2 ? C_BLACK : C_INK);
         }
         {   /* the load: core 0 (stage 1 and the wait), core 1 (stage 2), peaks over 2 s */
             uint32_t c0 = s_cpu, c1 = s_c1;
@@ -1549,7 +1777,7 @@ static volatile int32_t *knob_ptr(int i, int *kind)
     case PG_SEQ:
         if (U.seqmode) { volatile int32_t *p[4] = {&P.tension, &P.lock, &P.xfade, &P.swing}; *kind = i == 1 ? 2 : i == 2 ? 3 : 0; return p[i]; }
         *kind = 1; return 0;
-    case PG_VOICE: { volatile int32_t *p[4] = {&P.dec, &P.acc, &P.wave, &P.drive}; return p[i]; }
+    case PG_VOICE: { volatile int32_t *p[4] = {&P.dec, &P.acc, &P.chr, &P.drive}; return p[i]; }
     case PG_FX: { volatile int32_t *p[4] = {&P.dly_send, &P.dly_fb, &P.sub, &P.duck}; return p[i]; }
     default: { volatile int32_t *p[4] = {&P.cut, &P.res, &P.env, &P.burst}; return p[i]; }
     }
@@ -1559,12 +1787,13 @@ static int knob_page(knob_t *k)
     static const char *const LB[4][4] = {{"CUT", "RES", "ENV", "*BRST"}, {"TYPE", "DENS", "SLIDE", "ACC"}, {"DECAY", "ACCNT", "WAVE", "DRIVE"}, {"SEND", "FBACK", "SUB", "DUCK"}};
     static const char *const LB2[4] = {"TENS", "LOCK", "XFADE", "SWING"};
     static const char *const TL[NTH][4] = {{"PHRS", "DEPTH", "RES", "FB"}, {"RATE", "GATE", "-", "-"}, {"-", "DRIVE", "-", "-"}, {"TIME", "-", "-", "-"},
-                                           {"PHRS", "-", "-", "-"}, {"-", "-", "PATT", "-"}, {"-", "-", "-", "-"}, {"-", "-", "-", "TAIL"}};
+                                           {"PHRS", "-", "-", "-"}, {"-", "-", "PATT", "-"}, {"LEN", "LOOP", "LIVE", "FADE"}, {"-", "-", "-", "TAIL"}};
     int i, ht = held_throw();
     for (i = 0; i < 4; i++) {
         int kind; volatile int32_t *p = knob_ptr(i, &kind);
         k[i].hot = 0;
         if (ht >= 0) { k[i].label = TL[ht][i]; k[i].v16 = *p; k[i].disp = *p * 99 >> 16; k[i].hot = 1; continue; }
+        if (U.page == PG_VOICE && i == 2) { k[i].label = CHR_NAME[clampi(P.eng, 0, NENG - 1)]; k[i].v16 = *p; k[i].disp = *p * 99 >> 16; continue; }
         if (U.page == PG_SEQ && !U.seqmode) {
             uint8_t v = i == 0 ? U.g.type : i == 1 ? U.g.dens : i == 2 ? U.g.slide : U.g.acc;
             k[i].label = LB[1][i]; k[i].v16 = v * 257; k[i].disp = v; continue;
@@ -1608,7 +1837,7 @@ static void throw_down(int b)
         }
     }
     for (i = T_BUILD; i < NTH; i++)
-        if (U.latch[i] && i != T_FREEZE) {
+        if (U.latch[i]) {
             int a = -1, c2 = -1, j, k2;
             for (j = 0; j < 4; j++) for (k2 = 0; k2 < 4; k2++) if (j < k2 && combo_of(j, k2) == i) { a = j; c2 = k2; }
             if (b == a || b == c2) { U.latch[i] = 0; cmd(OP_RELEASE, (uint32_t)i, 0); U.tconsumed[b] = 1; return; }
@@ -1665,8 +1894,9 @@ static void button_down(int id)
     case BTN_SEQ: U.seq_used = 0; break;
     case BTN_EDIT: U.page = U.page == PG_VOICE ? PG_FX : PG_VOICE; break;
     case BTN_GLO: P.drums = !P.drums; say(P.drums ? "DRUMS ON" : "DRUMS OFF"); break;
-    case BTN_SEL:   /* the key backlight, on the FX page */
+    case BTN_SEL:   /* the key backlight, on the FX page; the sound dice on the VOICE page (on release) */
         if (U.page == PG_FX) { static const char *const LN[4] = {"LIGHT OFF", "LIGHT LOW", "LIGHT MID", "LIGHT HIGH"}; U.light = (U.light + 1) & 3; say(LN[U.light]); }
+        U.sel_t = fm1_ms;
         break;
     case BTN_SAVE: settings_store(); break;
     case BTN_REC: U.rec_held = 1; U.ntap = 0; break;
@@ -1688,6 +1918,7 @@ static void button_up(int id)
         break;
     case BTN_SEQ: if (!U.seq_used) { if (U.page != PG_SEQ) U.page = PG_SEQ; else U.seqmode = !U.seqmode; } break;
     case BTN_REC: U.rec_held = 0; apply_tap(); break;
+    case BTN_SEL: if (U.page == PG_VOICE) { if (fm1_ms - U.sel_t >= 600u) dice_undo(); else dice(); } break;
     }
     U.dirty_all = 1;
 }
@@ -1756,20 +1987,25 @@ static void app_main(void)
     memset(&U, 0, sizeof U);
     U.combo = -1; for (i = 0; i < 4; i++) U.tactive[i] = -1; U.last_note = -1;
     P.vol = ONE16 * 85 / 100; P.bpm10 = 1320; P.lock = 100; P.drums = 1; P.drum_lvl = ONE16 * 65 / 100; P.glide = ONE16 / 2;
-    P.mod_depth = ONE16 * 35 / 100; P.kick_tune = 1;
+    P.mod_depth = ONE16 * 35 / 100; P.kick_tune = 1; P.harm = ONE16 / 4;
     for (i = 0; i < NTH; i++) { P.tp[i][0] = P.tp[i][1] = P.tp[i][2] = P.tp[i][3] = ONE16 / 2; }
     P.tp[T_RISE][1] = ONE16 * 67 / 100; P.tp[T_RISE][3] = ONE16 * 7 / 10; P.tp[T_SHRED][2] = 0; P.tp[T_VOID][3] = ONE16 * 8 / 10;
     for (i = 0; i < 8; i++) { U.slot[i].seed = FACT[i].seed; U.slot[i].type = FACT[i].type; U.slot[i].dens = FACT[i].dens; U.slot[i].slide = FACT[i].slide; U.slot[i].acc = FACT[i].acc; U.slot[i].scale = FACT[i].scale; }
     load_preset(0);
-    if (settings_load(&SV, sizeof SV) == 0 && SV.ver == 3) {
+    U.light = 2;
+    if ((settings_load(&SV, sizeof SV) == 0 && SV.ver == 4) || (settings_load(&SV, SAVE_V3_N) == 0 && SV.ver == 3)) {
         load_preset(SV.preset);
-        P.cut = SV.cut; P.res = SV.res; P.env = SV.env; P.dec = SV.dec; P.acc = SV.acc; P.burst = SV.burst; P.wave = SV.wave;
+        P.cut = SV.cut; P.res = SV.res; P.env = SV.env; P.dec = SV.dec; P.acc = SV.acc; P.burst = SV.burst; P.chr = SV.wave;
         P.glide = SV.glide; P.sub = SV.sub; P.drive = SV.drive; P.dly_send = SV.dly_send; P.dly_fb = SV.dly_fb; P.duck = SV.duck;
         P.vol = SV.vol ? SV.vol : P.vol; P.dly_time = SV.dly_time; P.lock = SV.lock; P.bpm10 = SV.bpm10 ? SV.bpm10 : 1320; P.swing = SV.swing; P.drums = SV.drums;
         memcpy(U.slot, SV.slot, sizeof U.slot);
         U.pat = SV.pat & 7;
+        if (SV.ver == 4) {
+            P.eng = SV.eng < NENG ? SV.eng : 0; P.ratio = SV.ratio ? SV.ratio : 2; P.rel = SV.rel ? SV.rel : 8;
+            P.fold = SV.fold; P.formant = SV.formant; P.harm = SV.harm; if (SV.light) U.light = (SV.light - 1) & 3;
+        }
     }
-    U.light = 2; U.light_set = -1;
+    U.light_set = -1;
     dsp_init();
     dsp_ready = 1;
     genome_init(&U.g, U.slot[U.pat].seed, U.slot[U.pat].type, U.slot[U.pat].dens, U.slot[U.pat].slide, U.slot[U.pat].acc, U.slot[U.pat].scale);
@@ -1816,6 +2052,7 @@ static void app_main(void)
             case ENC_SELECT:
                 if (U.page == PG_SEQ) { U.g.scale = (uint8_t)((U.g.scale + (d > 0 ? 1 : 9)) % 10); P.scale = U.g.scale; generate(&U.g); save_slot(); publish(0); }
                 else if (U.page == PG_FX) P.dly_time = clampi(P.dly_time + (d > 0 ? 1 : -1), 0, 4);
+                else if (U.page == PG_VOICE) { P.eng = (P.eng + (d > 0 ? 1 : NENG - 1)) % NENG; say(ENG_NAME[P.eng]); }
                 else P.bpm10 = clampi(P.bpm10 + d * 10, 600, 2000);
                 break;
             case ENC_ALGORITHM: load_preset(U.preset + (d > 0 ? 1 : -1)); break;

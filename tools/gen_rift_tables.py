@@ -76,6 +76,11 @@ for c in range(NC):
     a1 = 1 / (1 + g * (g + K_BW))
     SB1.append(round(a1 * Q30)); SB2.append(round(g * a1 * Q30)); SB3.append(round(g * g * a1 * Q30))
 arr("SVFB_A1_T", SB1); arr("SVFB_A2_T", SB2); arr("SVFB_A3_T", SB3)
+# tan(pi fc / FO) in Q16 at the OS rate (GROWL's resonant SVF: its k varies, so its coefficients are computed)
+arr("TAN_OS_T", [round(math.tan(math.pi * min(fc_of(c), 0.42 * FO) / FO) * Q16) for c in range(NC)])
+# RUMBLE's small-speaker band: SVF band-pass at 700 Hz, Q 0.9, OS rate
+_g = math.tan(math.pi * 700 / FO); _k = 1 / 0.9; _a1 = 1 / (1 + _g * (_g + _k))
+define("BP700_A1", _a1 * Q30); define("BP700_A2", _g * _a1 * Q30); define("BP700_A3", _g * _g * _a1 * Q30); define("BP700_K16", _k * Q16)
 
 
 def cidx(f):
@@ -83,7 +88,7 @@ def cidx(f):
 
 
 for name, f in [("CI_120", 120), ("CI_150", 150), ("CI_40", 40), ("CI_100", 100), ("CI_720", 720), ("CI_9K", 9000),
-                ("CI_250", 250), ("CI_3K2", 3200), ("CI_20", 20), ("CI_7K", 7000), ("CI_160", 160), ("CI_700", 700), ("CI_55", 55), ("CI_28", 28)]:
+                ("CI_250", 250), ("CI_3K2", 3200), ("CI_20", 20), ("CI_7K", 7000), ("CI_160", 160), ("CI_700", 700), ("CI_55", 55), ("CI_28", 28), ("CI_140", 140)]:
     define(name, cidx(f))
 
 # ladder passband compensation sqrt(1 + min(k,4)), k = 0..5 in 1/64 steps, Q16
@@ -138,6 +143,7 @@ define("ATT_F_STEP", Q24 / (0.003 * FS))     # filter env attack 3 ms (Q24 per s
 define("ATT_A_STEP", Q24 / (0.001 * FS))     # amp attack 1 ms
 arr("K_REL_T", [kexp((1 + i * 199 / 63) / 1000 / 3) for i in range(64)])   # amp release 1..200 ms
 arr("K_GLIDE_T", [kexp(0.025 + 0.09 * i / 63) for i in range(64)])
+arr("K_IDX_T", [kexp((0.12 + 0.18 * i / 63) / 3) for i in range(64)])   # GROWL's FM index envelope, by DEC
 # accent capacitor: charge / discharge time against resonance (64 steps)
 arr("K_CAPC_T", [round((1 - math.exp(-1 / (FS * (0.002 + 0.043 * i / 63)))) * Q30) for i in range(64)])
 arr("K_CAPD_T", [round((1 - math.exp(-1 / (FS * (0.03 + 0.19 * i / 63)))) * Q30) for i in range(64)])
