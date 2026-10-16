@@ -150,21 +150,50 @@ def build_loader():
 
 # ---- app
 
+# the audio render, run from RAM (app.ld .hot_text; JIANT 0.6.78's way): out of the XIP cache's reach, which the
+# screen drawing between two audio blocks evicts
+HOT_FNS = ("app_audio", "control", "seq_step", "step_boundary", "tabi", "c1_job")
+RAMTEXT_END = 0x01C74000
+
+
+def hot_sections(ir):
+    """HOT_FNS' definitions in the optimised IR given section ".hot_text.<name>"; (the IR, the names found)"""
+    found = []
+
+    def put(m):
+        found.append(m.group(2))
+        return f'{m.group(1)} section ".hot_text.{m.group(2)}" {{'
+    ir = re.sub(r"^(define [^\n]*?@(" + "|".join(HOT_FNS) + r")(?:\.\w+)?\([^\n]*?)\s*\{$", put, ir, flags=re.M)
+    return ir, found
+
+
 def build_app():
     flags = [*CFLAGS, "-Ifirmware/hal", "-Ifirmware/src", "-Ifirmware/gen", f'-DFELUCCA_ID="{PRODUCT}"', f'-DAPP_VER="{VERSION or "0.0"}"']
+    # rift.c -> LLVM IR (no optimiser) -> optimised IR at -Os -> HOT_FNS moved to .hot_text -> code generator only.
+    # A section attribute in the source would stop the optimiser inlining into them (this clang inlines nothing
+    # across sections); renamed after it, they come out as they were, only in RAM
     cmds = [("cc", "-c", FW / "crt0.S", "-o", OUT / "crt0.o"),
             ("cc", "-c", FW / "hal" / "fm1_vec.S", "-o", OUT / "fm1_vec.o"),
             ("cc", "-c", FW / "hal" / "fm1_isr.S", "-o", OUT / "fm1_isr.o"),
-            ("cc", *flags, "-c", FW / "src" / "rift.c", "-o", OUT / "rift.o")]
+            ("cc", *flags, "-S", "-emit-llvm", "-c", FW / "src" / "rift.c", "-o", OUT / "rift_opt.ll")]
     tc_all(*cmds)
+    ir, found = hot_sections((OUT / "rift_opt.ll").read_text())
+    missing = [f for f in HOT_FNS if f not in found]
+    if missing:
+        raise SystemExit(f"hot RAM code: {missing} not found in the optimised IR (inlined away? mark them noinline)")
+    (OUT / "rift_hot.ll").write_text(ir)
+    cf = [f for f in flags if not f.startswith(("-I", "-D", "-W"))]
+    tc("cc", *cf, "-Xclang", "-disable-llvm-optzns", "-c", OUT / "rift_hot.ll", "-o", OUT / "rift.o")
     elf = OUT / "rift.elf"
     tc("pi32v2/bin/ld", "--gc-sections", "-e", "_start", "-T", FW / "app.ld", OUT / "crt0.o", OUT / "fm1_vec.o",
        OUT / "fm1_isr.o", OUT / "rift.o", "-o", elf)
-    for sect in ("text.bin", "data.bin", "ramtext.bin"):
+    for sect in ("text.bin", "data.bin", "ramtext.bin", "c1text.bin", "hottext.bin"):
         (OUT / sect).unlink(missing_ok=True)
     *_, syms, dis, rt = tc_all(("common/bin/objcopy", "-O", "binary", "-j", ".text", elf, OUT / "text.bin"),
                                ("common/bin/objcopy", "-O", "binary", "-j", ".data", elf, OUT / "data.bin"),
                                ("common/bin/objcopy", "-O", "binary", "-j", ".ram_text", elf, OUT / "ramtext.bin"),
+                               ("common/bin/objcopy", "-O", "binary", "-j", ".c1_text", elf, OUT / "c1text.bin"),
+                               ("common/bin/objcopy", "-O", "binary", "-j", ".hot_text", elf, OUT / "hottext.bin"),
                                ("common/bin/objdump", "-t", elf),
                                ("common/bin/objdump", "-d", elf),
                                ("common/bin/objdump", "-d", "-j", ".ram_text", elf))
@@ -173,8 +202,9 @@ def build_app():
     def symv(name):
         return int(re.search(r"^([0-9a-f]+) .*\s" + name + r"$", syms, re.M).group(1), 16)
     img = bytearray((OUT / "text.bin").read_bytes())
-    # .ram_text and .data follow .text at their load addresses; crt0 copies them by words
-    for sect, lname in (("ramtext.bin", "_rt_load"), ("data.bin", "_data_load")):
+    # .ram_text, .c1_text, .hot_text and .data follow .text at their load addresses; crt0 copies them by words
+    for sect, lname in (("ramtext.bin", "_rt_load"), ("c1text.bin", "_c1t_load"), ("hottext.bin", "_hot_load"),
+                        ("data.bin", "_data_load")):
         load = symv(lname)
         if load % 4:
             raise SystemExit(f"{lname} {load:#x} is not word aligned")
@@ -216,10 +246,38 @@ def check(img, syms, dis, rt):
         mm = re.search(r"^([0-9a-f]+) .*\s" + name + r"$", syms, re.M)
         return int(mm.group(1), 16) if mm else 0
     ram = sym("_bss_end") - 0x01C08000
-    pool = sym("_pool_end") - 0x01C20000
-    notes.append(f"image {len(img)} B of {APP_SLOT}; RAM .data+.bss {ram} B of 98304; pool {pool} B of 344064")
+    pool_top = max(sym("_pool_end"), sym("_c1_stack_hi"))
+    pool = pool_top - 0x01C20000
+    low = sym("_low_end") - sym("_low_start")
+    notes.append(f"image {len(img)} B of {APP_SLOT}; RAM .data+.bss {ram} B of 98304; pool {pool} B of {0x4C000} "
+                 f"(with the second core's stacks); low buffers {low} B of {0x7000}")
     if ram > 96 * 1024:
         errors.append(f"RAM .data+.bss {ram} B > 96 KiB")
+    if pool > 0x4C000:
+        errors.append("pool overflow")
+    # RAM code at the top of the pool: a call reaches +-4 MiB, so every call out of .c1_text / .hot_text must land
+    # within reach of the lowest RAM code address (JIANT 0.7.5's check)
+    targets, sect = [], None
+    for ln in dis.splitlines():
+        mm = re.match(r"Disassembly of section (\S+):", ln)
+        if mm:
+            sect = mm.group(1)
+            continue
+        if sect in (".ram_text", ".c1_text", ".hot_text"):
+            mm = re.search(r"\bcall\b[^<]*<([\w.]+)\s*:\s*([0-9a-f]+)\s*>", ln)
+            if mm and int(mm.group(2), 16) >= APP_XIP:
+                targets.append((int(mm.group(2), 16), mm.group(1)))
+    far = max(targets) if targets else (APP_XIP, "-")
+    reach = sym("_rt_start") + 0x400000 - far[0]
+    ramcode = sym("_hot_end") - sym("_rt_start")
+    notes.append(f"RAM code {ramcode} B of {RAMTEXT_END - sym('_rt_start')} (audio {sym('_hot_end') - sym('_hot_start')} B); "
+                 f"{len(targets)} calls into XIP, the farthest {far[1]} with {reach} B of reach to spare")
+    if reach < 12288:
+        errors.append(f"RAM code's farthest call ({far[1]}) has only {reach} B of reach to spare")
+    if RAMTEXT_END - sym("_hot_end") < 1024:
+        errors.append(f"RAM code headroom {RAMTEXT_END - sym('_hot_end')} B < 1024 B")
+    if sym("_hot_end") == sym("_hot_start"):
+        errors.append("no audio code in RAM (.hot_text empty)")
     return errors, notes
 
 

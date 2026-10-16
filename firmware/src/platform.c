@@ -36,6 +36,7 @@ enum { ENC_SELECT = 0, ENC_ALGORITHM = 1, ENC_KNOB1 = 2, ENC_KNOB2 = 3, ENC_KNOB
 #include "fm1_lcd_hw.h"
 #include "fm1_audio.h"
 #include "fm1_adc.h"
+#include "fm1_multicore.h"
 #include "bootguard.h"
 
 #ifndef APP_NAME
@@ -218,6 +219,16 @@ void fm1_timer5_irq(void)
 }
 extern void isr_timer5(void);
 
+/* ---- the second core's state for the app (hal/fm1_multicore.h): why it runs or not */
+enum { MC_ON, MC_REC, MC_BARRED, MC_NOSTART };
+static uint8_t mc_why = MC_NOSTART;
+static const char *mc_status(void)              /* "2 CORES", or why one */
+{
+    static const char *const LOST[4] = {"1 CORE", "1 CORE BAD READ", "1 CORE NO ANSWER", "1 CORE FAULT"};
+    if (mc_why == MC_ON) return fm1_mc_on ? "2 CORES" : LOST[fm1_mc_lost & 3u];
+    return mc_why == MC_REC ? "1 CORE (REC)" : mc_why == MC_BARRED ? "1 CORE (SINCE FAULT)" : "1 CORE (NO START)";
+}
+
 /* ---- the sound: ALNK0 I2S, two halves; the app renders, the MASTER knob scales, Q15 -> 24 bit (-6 dBFS ceiling) */
 static int32_t abuf[2u * HALF_WORDS] __attribute__((aligned(4)));
 static volatile int32_t master_q12 = 2048;
@@ -287,6 +298,9 @@ static void fm1_fault(const fm1_crash_t *c)
 {
     char b[12];
     uint32_t i, t0, v[3] = {c->vec, c->pc, c->rets};
+    if (fm1_mc_on)
+        fm1_mc_bar_set();                       /* a crash beside the second core: one core until power-off */
+    fm1_mc_hold();
     fm1_audio_stop();
     lcd_fill(0, 0, 240, 240, RGB(160, 0, 0));
     draw_text_box(0, 20, 240, &FONT_S, APP_NAME " CRASH", C_WHITE, 1);
@@ -306,7 +320,9 @@ void fm1_cstart(void)
 {
     extern uint32_t _data_start[], _data_end[], _data_load[], _bss_start[], _bss_end[];
     extern uint32_t _pool_start[], _pool_end[], _rt_start[], _rt_end[], _rt_load[];
+    extern uint32_t _c1t_start[], _c1t_end[], _c1t_load[], _hot_start[], _hot_end[], _hot_load[], _low_start[], _low_end[];
     uint32_t *s, *d, p3, boot_mode;
+    fm1_core1_stop();                           /* a second core a reset left running would read the RAM cleared below */
     fm1_time_init();
     fm1_reset_reason();
     p3 = fm1_boot.p3_rst;
@@ -320,7 +336,10 @@ void fm1_cstart(void)
     for (d = _bss_start; d < _bss_end; d++) *d = 0;
     for (d = _pool_start; d < _pool_end; d++) *d = 0;
     for (s = _data_load, d = _data_start; d < _data_end; s++, d++) *d = *s;
+    for (d = _low_start; d < _low_end; d++) *d = 0;
     for (s = _rt_load, d = _rt_start; d < _rt_end; s++, d++) *d = *s;
+    for (s = _c1t_load, d = _c1t_start; d < _c1t_end; s++, d++) *d = *s;   /* the second core's waiting loop */
+    for (s = _hot_load, d = _hot_start; d < _hot_end; s++, d++) *d = *s;   /* the audio render (build.py HOT_FNS) */
     fm1_mailbox_clear();
     fm1_guard_enable(FM1_GUARD_STACK | FM1_GUARD_WRITE | FM1_GUARD_BUS | FM1_GUARD_PC);
     fm1_boot.p3_rst = (uint8_t)p3;
@@ -337,6 +356,21 @@ void fm1_cstart(void)
     fm1_timer5_start(isr_timer5, 4);
     fm1_guard_lock_top();
     fm1_irq_enable_all();
+    /* the second core (hal/fm1_multicore.h), unless REC is held at power-on (one core this session), a boot is being
+     * retried, or it was given up / beside a crash since power-on. Its entry word is in the protected top of RAM:
+     * opened for it, interrupts off (up to 20 ms) */
+    fm1_delay_ms(30);
+    if ((fm1_in.buttons >> BTN_REC) & 1u)
+        mc_why = MC_REC;
+    else if (fm1_mc_barred())
+        mc_why = MC_BARRED;
+    else {
+        fm1_irq_off();
+        fm1_guard_unlock_top();
+        mc_why = fm1_mc_start() ? MC_ON : MC_NOSTART;
+        fm1_guard_lock_top();
+        fm1_irq_on();
+    }
     app_main();
     for (;;)
         platform_poll();

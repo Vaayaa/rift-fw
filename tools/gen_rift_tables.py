@@ -11,8 +11,14 @@ OUT = Path(__file__).resolve().parents[1] / "firmware" / "src" / "rift_tables.h"
 L = []
 
 
+RAM_TABLES = {"TANH_T", "SIN_T", "HB_T", "DUCK_DB_T", "G_BR_T"}   # read every sample: in RAM (.data), not through the XIP cache
+
+
 def arr(name, vals, ctype="int32_t", per=8):
-    L.append(f"static const {ctype} {name}[{len(vals)}] = {{")
+    if name in RAM_TABLES:      # (the section: without it the optimiser sees no store and makes it a constant again)
+        L.append(f"static {ctype} {name}[{len(vals)}] __attribute__((section(\".data.rtab\"))) = {{")
+    else:
+        L.append(f"static const {ctype} {name}[{len(vals)}] = {{")
     for i in range(0, len(vals), per):
         L.append("    " + ", ".join(str(int(v)) for v in vals[i:i + per]) + ",")
     L.append("};")
@@ -63,6 +69,13 @@ for c in range(NC):
     g = math.tan(math.pi * f / FS)
     G_BR.append(round(g / (1 + g) * Q30))
 arr("G_BR_T", G_BR)
+SB1, SB2, SB3 = [], [], []          # the same SVF at the base rate (the linear stages after the decimator)
+for c in range(NC):
+    f = min(fc_of(c), 0.45 * FS)
+    g = math.tan(math.pi * f / FS)
+    a1 = 1 / (1 + g * (g + K_BW))
+    SB1.append(round(a1 * Q30)); SB2.append(round(g * a1 * Q30)); SB3.append(round(g * g * a1 * Q30))
+arr("SVFB_A1_T", SB1); arr("SVFB_A2_T", SB2); arr("SVFB_A3_T", SB3)
 
 
 def cidx(f):

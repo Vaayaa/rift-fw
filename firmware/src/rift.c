@@ -24,7 +24,9 @@ static inline int32_t clampi(int32_t x, int32_t a, int32_t b) { return x < a ? a
 static inline int32_t lerp16(int32_t a, int32_t b, int32_t t) { return a + m16(b - a, t); }
 static inline int32_t iabs(int32_t x) { return x < 0 ? -x : x; }
 
-static int32_t tanh24(int32_t x)                /* Q24 in, Q24 out */
+#define HOT_INL static inline __attribute__((always_inline))
+#define HOT_FN static __attribute__((noinline))   /* tools/build.py HOT_FNS: in RAM */
+HOT_INL int32_t tanh24(int32_t x)                /* Q24 in, Q24 out */
 {
     uint32_t u, i, f;
     x = clampi(x, -(8 * ONE24) + 1, 8 * ONE24 - 1);
@@ -33,7 +35,7 @@ static int32_t tanh24(int32_t x)                /* Q24 in, Q24 out */
     f = (u >> 2) & 0xFFFFu;
     return TANH_T[i] + (int32_t)(((int64_t)(TANH_T[i + 1] - TANH_T[i]) * f) >> 16);
 }
-static int32_t sin24(uint32_t ph)               /* one cycle over 2^32 */
+HOT_INL int32_t sin24(uint32_t ph)               /* one cycle over 2^32 */
 {
     uint32_t i = ph >> 22, f = (ph >> 6) & 0xFFFFu;
     return SIN_T[i] + (int32_t)(((int64_t)(SIN_T[i + 1] - SIN_T[i]) * f) >> 16);
@@ -54,7 +56,7 @@ static uint32_t isqrt64(uint64_t v)               /* integer square root, shifts
     while (b) { if (v >= r + b) { v -= r + b; r = (r >> 1) + b; } else r >>= 1; b >>= 2; }
     return (uint32_t)r;
 }
-static int32_t tabi(const int32_t *t, int32_t n, int32_t c16)   /* table at a Q16 index, linear */
+HOT_FN int32_t tabi(const int32_t *t, int32_t n, int32_t c16)   /* table at a Q16 index, linear */
 {
     int32_t i, f;
     if (c16 < 0) return t[0];
@@ -422,7 +424,7 @@ static volatile uint8_t dsp_ready;
 
 /* what the screen and MIDI read from the ISR (single 32-bit values) */
 static volatile int32_t s_fcidx, s_env, s_acccap, s_burst, s_frac, s_prog, s_rate, s_amp, s_dfb, s_rms, s_wow;
-static volatile uint32_t s_abs, s_onsets, s_bar, s_gstep, s_clk24, s_playing, s_cpu;
+static volatile uint32_t s_abs, s_onsets, s_bar, s_gstep, s_clk24, s_playing, s_cpu, s_c1;
 static volatile uint8_t s_th[NTH];
 static int16_t scope[512];
 static volatile uint32_t scope_w;
@@ -433,6 +435,7 @@ static inline int32_t op_lp(op1_t *f, int32_t x) { int32_t v = m30(x - f->s, f->
 static inline int32_t op_hp(op1_t *f, int32_t x) { return x - op_lp(f, x); }
 typedef struct { int32_t i1, i2, a1, a2, a3; } svf_t;   /* Cytomic SVF, Butterworth k */
 static void svf_set(svf_t *f, int32_t c) { c = clampi(c, 0, 704); f->a1 = SVF_A1_T[c]; f->a2 = SVF_A2_T[c]; f->a3 = SVF_A3_T[c]; }
+static void svfb_set(svf_t *f, int32_t c) { c = clampi(c, 0, 704); f->a1 = SVFB_A1_T[c]; f->a2 = SVFB_A2_T[c]; f->a3 = SVFB_A3_T[c]; }   /* base rate */
 static inline void svf_run(svf_t *f, int32_t x, int32_t *lp, int32_t *bp)
 {
     int32_t v3 = x - f->i2, v1 = m30(f->i1, f->a1) + m30(v3, f->a2), v2 = f->i2 + m30(f->i1, f->a2) + m30(v3, f->a3);
@@ -444,7 +447,7 @@ static inline int32_t svf_hp(svf_t *f, int32_t x) { int32_t lp, bp; svf_run(f, x
 
 typedef struct { int32_t b[HB_N * 2]; uint32_t p; } hb_t;
 static inline void hb_push(hb_t *h, int32_t x) { h->b[h->p] = x; h->b[h->p + HB_N] = x; h->p = h->p + 1u == HB_N ? 0u : h->p + 1u; }
-static int32_t hb_out(const hb_t *h)
+HOT_INL int32_t hb_out(const hb_t *h)
 {
     const int32_t *b = h->b + h->p;
     int64_t a = (int64_t)HB_T[23] * b[23];
@@ -459,12 +462,12 @@ static struct {
     uint8_t gate, att, ampAtt, acc;
     uint32_t ph, phS, inc, incS, invdt;
     int32_t s0, s1, s2, s3, hs, G, G2, G3, G4, om, hG, a_hp, recip, k24, comp16;
-    op1_t preHP, sqHP, sqLP, hump, dly[4], harmHP, harmLP;
-    svf_t xl1, xl2, xh1, xh2, cab, hhp, riseHP;
-    hb_t decL, decH;
+    op1_t preHP, sqHP, sqLP, hump, harmHP, harmLP;
+    svf_t xl1, xh2, cab, riseHP;          /* (cab: the coefficients only; its state is stage 2's) */
+    int32_t l1sum;                      /* the low band's first LP stage, summed over the two OS samples */
     int32_t kF, kRel, kGlide, kCapC, kCapD, kKick, kDuck;
     int32_t preG, bias, tbias, fold16, gain16, wet16, chr16, hump16, low16, sub16, comp16b, post16, foldComp16;
-    int32_t corr16, rmsIn, rmsOut;
+    int32_t rmsIn;
     /* transport + sequencer */
     int32_t step_len16;                 /* samples per 1/16, Q16 */
     uint32_t inv_sl, frac16;            /* 2^32 / (step_len16 >> 8); position inside the step, Q16 */
@@ -480,15 +483,14 @@ static struct {
     struct { uint8_t st, latched, rel, auto_land; uint32_t s0, send, land_at; } th[NTH];
     int32_t md_cut16, md_res16, md_fbov, md_send16, md_sub16, md_pitch8, md_drive16, md_burst16, md_noise, md_force_acc, md_hpf;
     int32_t roll_steps16, roll_idx, roll_gate_on, roll_gate_env, roll_cut16, roll_hits, shred_div, shred_bits;
-    int32_t void_mute, void_tgt, void_lp, vlp, drop_burst16, duck_extra;
+    int32_t void_tgt, void_lp, vlp, drop_burst16, duck_extra;
     /* fx */
-    int32_t crush_acc, crush_hold, crush_lp, dtime16, dlyfb, wowph, dlpL, dlpR;
-    uint32_t dw, tw, tr16;
-    int32_t tape_mode, tape_rate16, tape_xf, tape_lp, spin_from;
-    int32_t duckEnv, dcx, dcy, dcxr, dcyr;
-    /* drums */
-    int32_t kEnv, kP, click, hEnv, kF8; uint32_t kPh; op1_t hHP; uint32_t noise;
-    int32_t rms;
+    int32_t dtime16, dlyfb;
+    int32_t tape_mode, tape_rate16, spin_from;
+    int32_t duckEnv;
+    uint32_t noise;
+    int32_t swing16;                        /* the odd steps' swing (this block) */
+    uint32_t blk, cur_i;                    /* blocks made by stage 1; the sample being made */
     uint32_t ctr;
 } D;
 
@@ -497,6 +499,36 @@ static struct {
 static int16_t dlyL[DLY_N] __attribute__((section(".pool")));
 static int16_t dlyR[DLY_N] __attribute__((section(".pool")));
 static int16_t tape[TAPE_N] __attribute__((section(".pool")));
+/* ---------------------------------------------------------------- the block, in two stages
+ * Stage 1 (core 0): commands, the sequencer, the voice at 2x, BURST -> the high band at 2x and the low band's first
+ *   stage into BK[b & 1], with what stage 2 needs of the control values (every 16 samples) and the drum hits.
+ * Stage 2 (core 1, hal/fm1_multicore.h): the decimator, the cabinet, crush, the low band, the tape delay, the
+ *   reference drums, the sum, the tape stop, the master -> the output. With two cores it renders block b - 1 while
+ *   core 0 makes block b (one block, 5.8 ms, later); with one, block b right after stage 1. */
+#define NB 256u                                 /* frames a block (platform.c HALF_FRAMES) */
+#define NC (NB / 16u)                           /* control ticks a block */
+typedef struct {
+    int32_t low16, msub16, burst, crdiv, crbits, void_tgt, send16, dt8, fb, vlp, tr, rmsIn, a1, a2, a3;
+    uint8_t tm, pad[3];
+} seg_t;
+typedef struct {
+    int32_t hos[2u * NB];                       /* the high band after BURST, at the OS rate (the decimator's input) */
+    int32_t l1[NB], sub[NB], rg[NB], bg[NB];    /* low band 1st stage, sub, roll gate, duck gain */
+    seg_t sg[NC];
+    uint32_t ntrig; uint16_t at[8]; uint32_t a[8];   /* the drum hits: sample, step */
+    int32_t drum_lvl; uint8_t drums, playing, kick_tune, root;
+} blk_t;
+static blk_t BK[2];
+static struct {                                 /* stage 2's state (core 1's while it runs) */
+    hb_t decH; svf_t xl2, cab, hhp;
+    int32_t corr16, rmsOut, crush_acc, crush_hold, crush_lp, void_mute;
+    uint32_t dw, wowph, noise, kPh, kInc, tw, tr16, us;
+    int32_t dlpL, dlpR; op1_t dly[4], hHP;
+    int32_t kEnv, kP, click, hEnv, kF8;
+    int32_t dcx, dcy, dcxr, dcyr, tape_lp, tape_xf, rms; uint8_t tm_prev;
+} S2;
+static int32_t *s2_out;
+
 static const uint8_t DLY_STEPS[5] = {1, 2, 3, 4, 6};
 static const char *const DLY_NAMES[5] = {"1/16", "1/8", "1/8D", "1/4", "1/4D"};
 
@@ -531,7 +563,7 @@ static void th_engage(int t, int latched)
     D.th[t].latched = (uint8_t)latched; D.th[t].rel = 0;
     if (!D.th[t].st) D.th[t].st = 1; else if (D.th[t].st == 3) D.th[t].st = 2;
 }
-static void step_boundary(void)
+HOT_FN void step_boundary(void)
 {
     uint32_t s = D.gstep; int t;
     for (t = 0; t < NTH; t++) {
@@ -540,7 +572,7 @@ static void step_boundary(void)
             D.th[t].st = 2; D.th[t].s0 = s;
             D.th[t].send = (s + PL) / PL * PL;
             if (D.th[t].send - s < 16u) D.th[t].send += PL;
-            if (t == T_STOP) { D.tape_mode = 1; D.tr16 = D.tw << 16; D.tape_rate16 = ONE16; }
+            if (t == T_STOP) { D.tape_mode = 1; D.tape_rate16 = ONE16; }
             emit(EV_ENGAGE, (uint32_t)t, 0, 0);
         }
         if (D.th[t].st == 2 && (D.th[t].rel || ((t == T_RISE || t == T_BUILD) && D.th[t].latched && s >= D.th[t].send))) {
@@ -592,21 +624,28 @@ static void wrap_check(int l, uint32_t c)
     uint32_t len = GA()->ln[l].len ? GA()->ln[l].len : 1u;
     if (c > 0 && c % len == 0 && P.lock < 100) emit(EV_WRAP, (uint32_t)l, (c / len) & 255u, 0);
 }
-static void drum_hit(uint32_t a)
+static void drum_hit(uint32_t a)                /* stage 1's part of a step: the duck, the beat event, the hit for stage 2 */
+{
+    uint32_t inb = a & 15u;
+    blk_t *B = &BK[D.blk & 1u];
+    if ((inb & 3u) == 0) { D.duckEnv = ONE24; emit(EV_BEAT, inb == 0, 0, 0); }
+    if (B->ntrig < 8u) { B->at[B->ntrig] = (uint16_t)D.cur_i; B->a[B->ntrig++] = a; }
+}
+static void drum_trig(const blk_t *B, uint32_t a)   /* stage 2's: the hit itself */
 {
     uint32_t inb = a & 15u;
     if ((inb & 3u) == 0) {
-        int32_t f8 = ((P.root + 24) << 8);
-        D.kEnv = ONE24; D.kP = ONE24; D.kPh = 0; D.click = ONE24; D.duckEnv = ONE24;
+        int32_t f8 = ((B->root + 24) << 8);
+        S2.kEnv = ONE24; S2.kP = ONE24; S2.kPh = 0; S2.click = ONE24;
         while (f8 > (31 << 8) + 128) f8 -= 12 << 8;   /* 41..82 Hz: MIDI 28..39 */
         while (f8 < (28 << 8)) f8 += 12 << 8;
-        D.kF8 = P.kick_tune ? f8 : (31 << 8);
-        emit(EV_BEAT, inb == 0, 0, 0);
+        S2.kF8 = B->kick_tune ? f8 : (31 << 8);
+        S2.kInc = pitch_inc(S2.kF8, 0);
     }
-    if ((inb & 3u) == 2) D.hEnv = ONE24; else if (D.hEnv < ONE24 / 3) D.hEnv = ONE24 * 35 / 100;
+    if ((inb & 3u) == 2) S2.hEnv = ONE24; else if (S2.hEnv < ONE24 / 3) S2.hEnv = ONE24 * 35 / 100;
 }
 static uint32_t hr(uint32_t salt, uint32_t a) { return hash32(GA()->seed ^ salt ^ ((a + 11u) * 0x165667b1u)) >> 24; }
-static void seq_step(void)
+HOT_FN void seq_step(void)
 {
     genome_t *g = GA();
     uint32_t a = D.abs, inb = a & 15u, ri, nri;
@@ -671,7 +710,7 @@ static void seq_step(void)
 }
 
 /* ---------------------------------------------------------------- control rate (every 8 samples) */
-static void control(void)
+HOT_FN void control(void)
 {
     int32_t sl16 = D.step_len16, gpos16, q16, bx, c16, cut, EM, res, k24, eng303 = 1;
     int t;
@@ -728,7 +767,7 @@ static void control(void)
     D.gain16 = tabi(BT_GAIN, 65, q16); D.wet16 = tabi(BT_WET, 65, q16); D.chr16 = tabi(BT_CHR, 65, q16);
     D.hump16 = tabi(BT_HUMP, 65, q16); D.low16 = tabi(BT_LOW, 65, q16); D.sub16 = tabi(BT_SUB, 65, q16);
     D.comp16b = tabi(BT_COMP, 65, q16); D.post16 = tabi(BT_POST, 65, q16);
-    svf_set(&D.cab, tabi(BT_CABC, 65, q16));
+    svfb_set(&D.cab, tabi(BT_CABC, 65, q16));
     if (D.md_hpf) svf_set(&D.riseHP, CI_120 + (D.md_hpf - 120) * 64 / 400);
     /* pitch */
     {
@@ -781,13 +820,116 @@ static void control(void)
     s_frac += (clampi(m16(bx, ONE16 * 8 / 10) + m16(m16(D.amp >> 8, bx), ONE16 * 3 / 10) + D.drop_burst16, 0, ONE16) - s_frac) / 20;
 }
 
+/* ---------------------------------------------------------------- stage 2 */
+HOT_FN void c1_job(uint32_t b)
+{
+    const blk_t *B = &BK[b & 1u];
+    int32_t *out = s2_out;
+    uint32_t i, t = 0;
+#ifndef DINGHY_HOST
+    uint32_t t0 = fm1_mc_ticks();
+#endif
+    if (!b) return;                                 /* (two cores, the first block: nothing made yet) */
+    for (i = 0; i < NB; i++) {
+        const seg_t *G = &B->sg[i >> 4];
+        int32_t hi, low, yl, yr, kick, hat, L, R;
+        /* the high band: decimated, then the cabinet and the 100 Hz HP (linear: at the base rate) */
+        hb_push(&S2.decH, B->hos[2u * i]); hb_push(&S2.decH, B->hos[2u * i + 1u]);
+        hi = hb_out(&S2.decH);
+        S2.cab.a1 = G->a1; S2.cab.a2 = G->a2; S2.cab.a3 = G->a3;
+        hi = svf_hp(&S2.hhp, svf_lp(&S2.cab, hi));
+        if ((i & 15u) == 0) {   /* slow loudness correction, +-6 dB, target +3 dB at full BURST */
+            int32_t ri = G->rmsIn > 64 ? G->rmsIn : 64, ro = S2.rmsOut > 64 ? S2.rmsOut : 64;
+            int32_t tgt = m16((int32_t)(((uint32_t)ri << 4) / (((uint32_t)ro >> 12) | 1u)), ONE16 + G->burst);   /* power ratio, Q16 */
+            int32_t g16 = tgt < ONE16 / 4 ? ONE16 / 2 : tgt > 4 * ONE16 ? 2 * ONE16 : (int32_t)isqrt64((uint64_t)tgt << 16);
+            S2.corr16 += (g16 - S2.corr16) / 200;
+        }
+        hi = m16(hi, S2.corr16);
+        S2.rmsOut += (m24(hi, hi) - S2.rmsOut) >> 13;
+        hi = m16(hi, B->rg[i]);
+        /* the low band: second LP stage, the sub */
+        low = m16(m16(svf_lp(&S2.xl2, B->l1[i]), G->low16) + B->sub[i], G->msub16);
+        low = m16(tanh24(m16(low, 92560)), 46396);           /* 0.708 tanh(low / 0.708) */
+        /* crush: BURST above .85 or SHRED */
+        if (G->crdiv > 1 || G->crbits < 16) {
+            int32_t sh2 = 24 - (G->crbits - 1);
+            if (++S2.crush_acc >= G->crdiv) { S2.crush_acc = 0; S2.crush_hold = (int32_t)((uint32_t)(hi >> sh2) << sh2); }
+            S2.crush_lp += (S2.crush_hold - S2.crush_lp) * 3 / 4; hi = S2.crush_lp;
+        }
+        /* void: dry and sub out over 20 ms */
+        S2.void_mute += (G->void_tgt - S2.void_mute) / 600;
+        hi = m16(hi, S2.void_mute); low = m16(low, S2.void_mute);
+        {   /* tape delay: ping-pong, high band only */
+            int32_t dtm = G->dt8, dt8 = dtm + m24(m16(sin24(S2.wowph), ONE16 * 15 / 10000), dtm), di = dt8 >> 8, df = (dt8 & 255) << 8;
+            uint32_t r0 = (S2.dw + DLY_N - (uint32_t)di) % DLY_N, r1 = (r0 + DLY_N - 1u) % DLY_N;
+            int32_t send = m16(hi, G->send16), fl, fr;
+            yl = ((int32_t)dlyL[r0] * 512) + m16(((int32_t)dlyL[r1] - dlyL[r0]) * 512, df);
+            yr = ((int32_t)dlyR[r0] * 512) + m16(((int32_t)dlyR[r1] - dlyR[r0]) * 512, df);
+            S2.wowph += 58434u;                              /* ~0.6 Hz */
+            fl = m16(op_lp(&S2.dly[1], op_hp(&S2.dly[0], yr)), G->fb);
+            fr = m16(op_lp(&S2.dly[3], op_hp(&S2.dly[2], yl)), G->fb);
+            fl = m16(tanh24(m16(fl, 78643)), 54613); fr = m16(tanh24(m16(fr, 78643)), 54613);
+            dlyL[S2.dw] = (int16_t)clampi((send + fl) >> 9, -32767, 32767);
+            dlyR[S2.dw] = (int16_t)clampi(fr >> 9, -32767, 32767);
+            S2.dw = S2.dw + 1u == DLY_N ? 0u : S2.dw + 1u;
+            if (G->vlp >= 0) {
+                int32_t gg = G_BR_T[clampi(G->vlp, 0, 704)];
+                S2.dlpL += m30(yl - S2.dlpL, gg); S2.dlpR += m30(yr - S2.dlpR, gg); yl = S2.dlpL; yr = S2.dlpR;
+            }
+        }
+        /* duck + sum */
+        L = m16(low + hi + yl, B->bg[i]); R = m16(low + hi + yr, B->bg[i]);
+        /* scope: the bass, every 2nd sample */
+        if (i & 1u) { scope[scope_w & 511u] = (int16_t)clampi((L + R) >> 10, -32767, 32767); scope_w++; }
+        /* reference drums */
+        while (t < B->ntrig && B->at[t] == i) drum_trig(B, B->a[t++]);
+        S2.kP = m30(S2.kP, K_KICKP);
+        S2.kPh += S2.kInc + (uint32_t)m24((int32_t)(S2.kInc >> 1), m24(S2.kP, S2.kP)) * 4u;
+        S2.kEnv = m30(S2.kEnv, K_KICK_T[48]); S2.click = m30(S2.click, K_CLICK);
+        S2.noise = S2.noise * 1103515245u + 12345u;
+        kick = m24(sin24(S2.kPh), m16(S2.kEnv, 72090)) + m16(m24((int32_t)S2.noise >> 7, S2.click), ONE16 / 4);
+        kick = tanh24(m16(kick, 91750));
+        S2.hEnv = m30(S2.hEnv, K_HAT);
+        hat = m16(m24(op_hp(&S2.hHP, (int32_t)S2.noise >> 7), S2.hEnv), ONE16 * 35 / 100);
+        if (B->drums && B->playing) { L += m16(kick + m16(hat, ONE16 * 8 / 10), B->drum_lvl); R += m16(kick + m16(hat, ONE16 * 11 / 10), B->drum_lvl); }
+        /* DC block */
+        { int32_t a = L - S2.dcx + m30(S2.dcy, 1072235000), c = R - S2.dcxr + m30(S2.dcyr, 1072235000); S2.dcx = L; S2.dcy = a; S2.dcxr = R; S2.dcyr = c; L = a; R = c; }
+        /* tape stop (mono varispeed) */
+        tape[S2.tw] = (int16_t)clampi((L + R) >> 10, -32767, 32767);
+        if (G->tm == 1 && !S2.tm_prev) S2.tr16 = S2.tw << 16;   /* engaged: the head starts where the tape is now */
+        S2.tm_prev = G->tm;
+        S2.tw = S2.tw + 1u == TAPE_N ? 0u : S2.tw + 1u;
+        if (G->tm == 1) {
+            uint32_t ti, t2; int32_t tv, g8, tr = G->tr;
+            S2.tr16 += (uint32_t)tr;
+            if ((S2.tr16 >> 16) >= TAPE_N) S2.tr16 -= TAPE_N << 16;
+            ti = S2.tr16 >> 16; t2 = ti + 1u == TAPE_N ? 0u : ti + 1u;
+            tv = ((int32_t)tape[ti] * 512) + m16(((int32_t)tape[t2] - tape[ti]) * 512, (int32_t)(S2.tr16 & 0xFFFFu));
+            g8 = clampi(tr * 4, 0, ONE16);                         /* silent when the tape stands still */
+            S2.tape_lp += m30(m16(tv, g8) - S2.tape_lp, G_BR_T[clampi(CI_150 + m16(tr, 500), 0, 704)]);
+            if (S2.tape_xf < ONE16) S2.tape_xf += ONE16 / 100;
+            L = lerp16(L, S2.tape_lp, S2.tape_xf); R = lerp16(R, S2.tape_lp, S2.tape_xf);
+        } else if (S2.tape_xf > 0) { S2.tape_xf -= ONE16 / 220; if (S2.tape_xf < 0) S2.tape_xf = 0; L = lerp16(L, S2.tape_lp, S2.tape_xf); R = lerp16(R, S2.tape_lp, S2.tape_xf); }
+        /* master: soft ceiling at -1 dBFS, out in Q15 */
+        L = m16(tanh24(m16(m16(L, P.vol), 73550)), 58395);
+        R = m16(tanh24(m16(m16(R, P.vol), 73550)), 58395);
+        S2.rms += (m24(L, L) - S2.rms) >> 11;
+        out[2u * i] += L >> 9;
+        out[2u * i + 1u] += R >> 9;
+    }
+#ifndef DINGHY_HOST
+    S2.us = (fm1_mc_ticks() - t0) / FM1_TICKS_PER_US;
+#endif
+}
+
 /* ---------------------------------------------------------------- the audio ISR */
-static void app_audio(int32_t *out, uint32_t n)
+HOT_FN void app_audio(int32_t *out, uint32_t n)
 {
 #ifndef DINGHY_HOST
     uint32_t t_start = fm1_ticks();
 #endif
     uint32_t i;
+    int mc;
     /* commands from the main loop */
     while (cq_r != cq_w) {
         cmd_t c = cq[cq_r & 63u];
@@ -816,7 +958,14 @@ static void app_audio(int32_t *out, uint32_t n)
         case OP_RELEASE: if (D.th[c.a].st) { D.th[c.a].rel = 1; D.th[c.a].latched = 0; } break;
         case OP_ABORT: th_land(c.a, 1); break;
         case OP_KEEP: if (c.a == T_RISE || c.a == T_BUILD) P.cut = clampi(P.cut + D.md_cut16 / 192, 0, ONE16); th_land(c.a, 1); break;
-        case OP_PANIC: { int t; for (t = 0; t < NTH; t++) th_land(t, 1); D.dlyfb = 0; memset(dlyL, 0, sizeof dlyL); memset(dlyR, 0, sizeof dlyR); emit(EV_PANIC, 0, 0, 0); break; }
+        case OP_PANIC: {
+            int t;
+            for (t = 0; t < NTH; t++) th_land(t, 1);
+            D.dlyfb = 0; memset(dlyL, 0, sizeof dlyL); memset(dlyR, 0, sizeof dlyR);
+            for (t = 0; t < (int)NC; t++) BK[0].sg[t].fb = BK[1].sg[t].fb = 0;   /* (core 1 is idle here: block start) */
+            emit(EV_PANIC, 0, 0, 0);
+            break;
+        }
         case OP_FILL: D.fill = c.a; break;
         case OP_DROP: D.drop_arm = 1; break;
         case OP_GENOME: if (c.b && D.playing) g_pend = c.a; else { g_a = c.a; g_pend = -1; } break;
@@ -829,9 +978,21 @@ static void app_audio(int32_t *out, uint32_t n)
         D.step_len16 = (int32_t)((q << 16) + (r << 16) / bpm);
         D.inv_sl = 0xFFFFFFFFu / (uint32_t)(D.step_len16 >> 8);
     }
-    for (i = 0; i < n; i++) {
-        int32_t sl16 = D.step_len16, low = 0, hi = 0, L, R, k;
+    (void)n;                                        /* (always NB: platform.c HALF_FRAMES) */
+    D.swing16 = m16(P.swing, D.step_len16);
+    s2_out = out;
+    mc = fm1_mc_run(c1_job, D.blk);                 /* stage 2 of the block before on core 1, beside stage 1 */
+    D.blk++;
+    {
+        blk_t *B = &BK[D.blk & 1u];
+        B->ntrig = 0; B->playing = D.playing; B->drums = (uint8_t)(P.drums != 0); B->drum_lvl = P.drum_lvl;
+        B->kick_tune = (uint8_t)(P.kick_tune != 0); B->root = (uint8_t)P.root;
+    }
+    for (i = 0; i < NB; i++) {
+        int32_t sl16 = D.step_len16, k;
         uint32_t o;
+        blk_t *B = &BK[D.blk & 1u];
+        D.cur_i = i;
         /* ---- clocks */
         D.gpos16 += ONE16;
         if (D.gpos16 >= sl16) {
@@ -842,7 +1003,7 @@ static void app_audio(int32_t *out, uint32_t n)
             }
         }
         if (D.playing) {
-            int32_t swing16 = (D.abs & 1u) ? m16(P.swing, sl16) : 0;
+            int32_t swing16 = (D.abs & 1u) ? D.swing16 : 0;
             D.clk_acc += 6u * ONE16;                          /* 24 ppqn = 6 per 1/16 */
             while (D.clk_acc >= (uint32_t)sl16) { D.clk_acc -= (uint32_t)sl16; s_clk24++; }
             if (!D.trig_done && D.spos16 >= swing16) { D.trig_done = 1; D.ev[0].at16 = 0; D.nev = 0; seq_step(); D.ev[9].at16 = D.spos16; }
@@ -885,6 +1046,18 @@ static void app_audio(int32_t *out, uint32_t n)
         D.roll_gate_env += (k - D.roll_gate_env) / (k ? 2 : 50);
 
         if (++D.ctr >= 16u) { D.ctr = 0; control(); }
+        if ((i & 15u) == 15u) {                     /* this segment's control values for stage 2 */
+            seg_t *G = &B->sg[i >> 4];
+            int32_t div = 1, bits = 16;
+            if (s_burst > ONE16 * 85 / 100) { int32_t uu = (s_burst - ONE16 * 85 / 100) * 100 / 15; div = 1 + (uu > ONE16 / 2); bits = 16 - (8 * uu >> 16); }
+            if (D.th[T_SHRED].st >= 2) { if (D.shred_div > div) div = D.shred_div; if (D.shred_bits < bits) bits = D.shred_bits; }
+            G->crdiv = div; G->crbits = bits;
+            G->low16 = D.low16; G->msub16 = D.md_sub16; G->burst = s_burst; G->void_tgt = D.void_tgt;
+            G->send16 = clampi(P.dly_send + D.md_send16, 0, ONE16);
+            G->dt8 = D.dtime16; G->fb = D.dlyfb; G->vlp = D.th[T_VOID].st ? D.void_lp : -1;
+            G->tr = D.tape_rate16; G->tm = (uint8_t)D.tape_mode; G->rmsIn = D.rmsIn;
+            G->a1 = D.cab.a1; G->a2 = D.cab.a2; G->a3 = D.cab.a3;
+        }
 
         /* ---- envelopes (base rate) */
         if (D.att) { D.envF += ATT_F_STEP; if (D.envF >= ONE24) { D.envF = ONE24; D.att = 0; } } else D.envF = m30(D.envF, D.kF);
@@ -898,9 +1071,9 @@ static void app_audio(int32_t *out, uint32_t n)
 
         /* ---- 2x oversampled core */
         for (o = 0; o < 2u; o++) {
-            int32_t x, y, s, u, v, y1, y2, y3, y4, lo, hiS, h, hg, sh, sub;
+            int32_t x, y, s, u, v, y1, y2, y3, y4, hiS, h, hg, sh;
             uint32_t ph, dt = D.inc;
-            D.ph += dt; D.phS += D.incS;
+            D.ph += dt;
             ph = D.ph;
             s = (int32_t)(ph >> 7) - ONE24;                 /* saw, Q24 */
             if (ph < dt) { u = (int32_t)(((uint64_t)(ph >> 12) * D.invdt) >> 7); s += m24(ONE24 - u, ONE24 - u); }
@@ -943,16 +1116,17 @@ static void app_audio(int32_t *out, uint32_t n)
                     y = lerp16(y, m16(sin24((uint32_t)z << 6), ONE16 * 9 / 10), clampi(m16(fa, ONE16 * 14 / 10), 0, ONE16));
                 }
             }
-            /* split at 120 Hz (Linkwitz-Riley 4) */
+            /* split at 120 Hz (Linkwitz-Riley 4): the first stage here, the low band's second stage at the base rate
+             * (its first LP stage is 90 dB down at the OS Nyquist: summing the two samples is all the decimation needs) */
             {
                 int32_t l1, b1, h1;
                 svf_run(&D.xl1, y, &l1, &b1);
                 h1 = y - m30(b1, K_BW_Q30) - l1;
-                lo = svf_lp(&D.xl2, l1);
+                D.l1sum += l1 >> 1;
                 hiS = svf_hp(&D.xh2, h1);
             }
             if (D.md_hpf) hiS = svf_hp(&D.riseHP, hiS);
-            D.rmsIn += (m24(hiS, hiS) - D.rmsIn) >> 14;
+            if (o) D.rmsIn += (m24(hiS, hiS) - D.rmsIn) >> 13;
             /* BURST on the high band */
             if (D.wet16 > 0) {
                 h = hiS + m16(op_hp(&D.hump, hiS), D.hump16);
@@ -963,107 +1137,33 @@ static void app_audio(int32_t *out, uint32_t n)
                 } else sh = lerp16(tanh24(hg), clampi(hg, -(ONE24 * 72 / 100), ONE24), D.chr16 - ONE16);
                 h = m16(lerp16(hiS, m16(sh, 62259), D.wet16), D.comp16b);
             } else h = m16(hiS, D.comp16b);
-            h = svf_hp(&D.hhp, svf_lp(&D.cab, h));
-            h = m16(h, D.corr16);
-            D.rmsOut += (m24(h, h) - D.rmsOut) >> 14;
-            /* sub: phase-locked, follows the amp envelope and slide */
-            sub = P.sub ? m16(m24(m16(m16(sin24(D.phS), P.sub), m16(D.sub16, D.md_sub16)), D.amp), ONE16 * 55 / 100) : 0;
-            hb_push(&D.decL, m16(m16(lo, D.low16) + sub, D.md_sub16));
-            hb_push(&D.decH, m16(h, D.roll_gate_env));
-            (void)x;
+            B->hos[2u * i + o] = h;
         }
-        if ((D.ctr & 15u) == 0) {   /* slow loudness correction, +-6 dB, target +3 dB at full BURST */
-            int32_t ri = D.rmsIn > 64 ? D.rmsIn : 64, ro = D.rmsOut > 64 ? D.rmsOut : 64;
-            int32_t tgt = m16((int32_t)(((uint32_t)ri << 4) / (((uint32_t)ro >> 12) | 1u)), ONE16 + s_burst);   /* power ratio, Q16 */
-            int32_t g16 = tgt < ONE16 / 4 ? ONE16 / 2 : tgt > 4 * ONE16 ? 2 * ONE16 : (int32_t)isqrt64((uint64_t)tgt << 16);
-            D.corr16 += (g16 - D.corr16) / 200;
-        }
-        low = hb_out(&D.decL); hi = hb_out(&D.decH);
-        low = m16(tanh24(m16(low, 92560)), 46396);           /* 0.708 tanh(low / 0.708) */
-        /* crush: BURST above .85 or SHRED */
+        /* the low band's first stage and the sub, the roll gate, the duck gain: for stage 2 */
+        B->l1[i] = D.l1sum; D.l1sum = 0;
+        D.phS += D.inc;                                   /* an octave below the OS increment's pitch */
+        B->sub[i] = P.sub ? m16(m24(m16(m16(sin24(D.phS), P.sub), m16(D.sub16, D.md_sub16)), D.amp), ONE16 * 55 / 100) : 0;
+        B->rg[i] = D.roll_gate_env;
+        D.duckEnv = m30(D.duckEnv, D.kDuck);
         {
-            int32_t div = 1, bits = 16;
-            if (s_burst > ONE16 * 85 / 100) { int32_t uu = (s_burst - ONE16 * 85 / 100) * 100 / 15; div = 1 + (uu > ONE16 / 2); bits = 16 - (8 * uu >> 16); }
-            if (D.th[T_SHRED].st >= 2) { if (D.shred_div > div) div = D.shred_div; if (D.shred_bits < bits) bits = D.shred_bits; }
-            if (div > 1 || bits < 16) {
-                int32_t sh2 = 24 - (bits - 1);
-                if (++D.crush_acc >= div) { D.crush_acc = 0; D.crush_hold = (int32_t)((uint32_t)(hi >> sh2) << sh2); }
-                D.crush_lp += (D.crush_hold - D.crush_lp) * 3 / 4; hi = D.crush_lp;
-            }
+            int32_t ddb = m16(m16(P.duck * 96, D.duckEnv >> 8) + m16(D.duck_extra * 48, D.duckEnv >> 8), ONE16);
+            int32_t dg = DUCK_DB_T[clampi(ddb >> 16, 0, 192)];
+            B->bg[i] = m16(m16(dg, D.post16), ONE16 * 9 / 10);
+            D.duck_extra = m30(D.duck_extra, 1073688000);
         }
-        /* void: dry and sub out over 20 ms */
-        D.void_mute += (D.void_tgt - D.void_mute) / 600;
-        hi = m16(hi, D.void_mute); low = m16(low, D.void_mute);
-        /* tape delay: ping-pong, high band only */
-        {
-            int32_t dt8 = D.dtime16 + m24(m16(sin24(D.wowph), ONE16 * 15 / 10000), D.dtime16), di = dt8 >> 8, df = (dt8 & 255) << 8;
-            uint32_t r0 = (D.dw + DLY_N - (uint32_t)di) % DLY_N, r1 = (r0 + DLY_N - 1u) % DLY_N;
-            int32_t yl = ((int32_t)dlyL[r0] * 512) + m16(((int32_t)dlyL[r1] - dlyL[r0]) * 512, df);
-            int32_t yr = ((int32_t)dlyR[r0] * 512) + m16(((int32_t)dlyR[r1] - dlyR[r0]) * 512, df);
-            int32_t send = m16(hi, clampi(P.dly_send + D.md_send16, 0, ONE16)), fl, fr;
-            D.wowph += 58434u;                               /* ~0.6 Hz */
-            fl = m16(op_lp(&D.dly[1], op_hp(&D.dly[0], yr)), D.dlyfb);
-            fr = m16(op_lp(&D.dly[3], op_hp(&D.dly[2], yl)), D.dlyfb);
-            fl = m16(tanh24(m16(fl, 78643)), 54613); fr = m16(tanh24(m16(fr, 78643)), 54613);
-            dlyL[D.dw] = (int16_t)clampi((send + fl) >> 9, -32767, 32767);
-            dlyR[D.dw] = (int16_t)clampi(fr >> 9, -32767, 32767);
-            D.dw = D.dw + 1u == DLY_N ? 0u : D.dw + 1u;
-            if (D.th[T_VOID].st) {
-                int32_t gg = G_BR_T[clampi(D.void_lp, 0, 704)];
-                D.dlpL += m30(yl - D.dlpL, gg); D.dlpR += m30(yr - D.dlpR, gg); yl = D.dlpL; yr = D.dlpR;
-            }
-            /* duck + sum */
-            D.duckEnv = m30(D.duckEnv, D.kDuck);
-            {
-                int32_t ddb = m16(m16(P.duck * 96, D.duckEnv >> 8) + m16(D.duck_extra * 48, D.duckEnv >> 8), ONE16);
-                int32_t dg = DUCK_DB_T[clampi(ddb >> 16, 0, 192)], bg = m16(m16(dg, D.post16), ONE16 * 9 / 10);
-                D.duck_extra = m30(D.duck_extra, 1073688000);
-                L = m16(low + hi + yl, bg); R = m16(low + hi + yr, bg);
-            }
-        }
-        /* scope: the bass, every 2nd sample */
-        if (i & 1u) { scope[scope_w & 511u] = (int16_t)clampi((L + R) >> 10, -32767, 32767); scope_w++; }
-        /* reference drums */
-        {
-            int32_t kf8 = D.kF8 ? D.kF8 : (31 << 8), kick, hat;
-            D.kP = m30(D.kP, K_KICKP);
-            D.kPh += pitch_inc(kf8, 0) + (uint32_t)m24((int32_t)(pitch_inc(kf8, 0) >> 1), m24(D.kP, D.kP)) * 4u;
-            D.kEnv = m30(D.kEnv, K_KICK_T[clampi(16 + 32, 0, 63)]); D.click = m30(D.click, K_CLICK);
-            D.noise = D.noise * 1103515245u + 12345u;
-            kick = m24(sin24(D.kPh), m16(D.kEnv, 72090)) + m16(m24((int32_t)D.noise >> 7, D.click), ONE16 / 4);
-            kick = tanh24(m16(kick, 91750));
-            D.hEnv = m30(D.hEnv, K_HAT);
-            D.hHP.G = G_BR_T[CI_7K];
-            hat = m24(op_hp(&D.hHP, (int32_t)D.noise >> 7), D.hEnv);
-            hat = m16(hat, ONE16 * 35 / 100);
-            if (P.drums && D.playing) { L += m16(kick + m16(hat, ONE16 * 8 / 10), P.drum_lvl); R += m16(kick + m16(hat, ONE16 * 11 / 10), P.drum_lvl); }
-        }
-        /* DC block */
-        { int32_t yl = L - D.dcx + m30(D.dcy, 1072235000), yr = R - D.dcxr + m30(D.dcyr, 1072235000); D.dcx = L; D.dcy = yl; D.dcxr = R; D.dcyr = yr; L = yl; R = yr; }
-        /* tape stop (mono varispeed) */
-        tape[D.tw] = (int16_t)clampi((L + R) >> 10, -32767, 32767);
-        D.tw = D.tw + 1u == TAPE_N ? 0u : D.tw + 1u;
-        if (D.tape_mode == 1) {
-            uint32_t ti, t2; int32_t tv, g8;
-            D.tr16 += (uint32_t)D.tape_rate16;
-            if ((D.tr16 >> 16) >= TAPE_N) D.tr16 -= TAPE_N << 16;
-            ti = D.tr16 >> 16; t2 = ti + 1u == TAPE_N ? 0u : ti + 1u;
-            tv = ((int32_t)tape[ti] * 512) + m16(((int32_t)tape[t2] - tape[ti]) * 512, (int32_t)(D.tr16 & 0xFFFFu));
-            g8 = clampi(D.tape_rate16 * 4, 0, ONE16);               /* silent when the tape stands still */
-            D.tape_lp += m30(m16(tv, g8) - D.tape_lp, G_BR_T[clampi(CI_150 + m16(D.tape_rate16, 500), 0, 704)]);
-            if (D.tape_xf < ONE16) D.tape_xf += ONE16 / 100;
-            L = lerp16(L, D.tape_lp, D.tape_xf); R = lerp16(R, D.tape_lp, D.tape_xf);
-        } else if (D.tape_xf > 0) { D.tape_xf -= ONE16 / 220; if (D.tape_xf < 0) D.tape_xf = 0; L = lerp16(L, D.tape_lp, D.tape_xf); R = lerp16(R, D.tape_lp, D.tape_xf); }
-        /* master: soft ceiling at -1 dBFS, out in Q15 */
-        L = m16(tanh24(m16(m16(L, P.vol), 73550)), 58395);
-        R = m16(tanh24(m16(m16(R, P.vol), 73550)), 58395);
-        D.rms += (m24(L, L) - D.rms) >> 11;
-        out[2u * i] += L >> 9;
-        out[2u * i + 1u] += R >> 9;
     }
-    s_abs = D.abs; s_onsets = D.onsets; s_bar = D.bar; s_gstep = D.gstep; s_playing = D.playing; s_rms = D.rms;
+    if (mc) {
+        if (fm1_mc_wait() < 0) {                    /* core 1 given up (hal/fm1_multicore.h): that block is lost */
+#ifndef DINGHY_HOST
+            fm1_mc_bar_set();                       /* one core until power-off */
+#endif
+        }
+    } else
+        c1_job(D.blk);                              /* one core: stage 2 of this block, now */
+    s_abs = D.abs; s_onsets = D.onsets; s_bar = D.bar; s_gstep = D.gstep; s_playing = D.playing; s_rms = S2.rms;
 #ifndef DINGHY_HOST
     s_cpu = (fm1_ticks() - t_start) / FM1_TICKS_PER_US;
+    s_c1 = S2.us;
 #endif
 }
 
@@ -1071,12 +1171,14 @@ static void dsp_init(void)
 {
     D.hG = G_OS_T[CI_150]; D.a_hp = (1 << 30) - D.hG;
     D.preHP.G = G_OS_T[CI_20]; D.sqLP.G = G_OS_T[CI_9K]; D.hump.G = G_OS_T[CI_720];
-    svf_set(&D.xl1, CI_120); svf_set(&D.xl2, CI_120); svf_set(&D.xh1, CI_120); svf_set(&D.xh2, CI_120);
-    svf_set(&D.hhp, CI_100); svf_set(&D.cab, 704); svf_set(&D.riseHP, CI_120);
-    D.dly[0].G = D.dly[2].G = G_BR_T[CI_250]; D.dly[1].G = D.dly[3].G = G_BR_T[CI_3K2];
-    D.corr16 = ONE16; D.void_mute = D.void_tgt = ONE16; D.void_lp = 640; D.tape_rate16 = ONE16;
+    svf_set(&D.xl1, CI_120); svf_set(&D.xh2, CI_120); svf_set(&D.riseHP, CI_120); svfb_set(&D.cab, 704);
+    svfb_set(&S2.xl2, CI_120); svfb_set(&S2.hhp, CI_100); svfb_set(&S2.cab, 704);
+    S2.hHP.G = G_BR_T[CI_7K];
+    S2.dly[0].G = S2.dly[2].G = G_BR_T[CI_250]; S2.dly[1].G = S2.dly[3].G = G_BR_T[CI_3K2];
+    S2.noise = 33333; S2.kF8 = 31 << 8; S2.kInc = pitch_inc(S2.kF8, 0); S2.corr16 = ONE16; S2.void_mute = ONE16;
+    D.void_tgt = ONE16; D.void_lp = 640; D.tape_rate16 = ONE16;
     D.roll_gate_env = ONE16; D.roll_gate_on = 1 << 30; D.roll_idx = -1; D.shred_div = 1; D.shred_bits = 16;
-    D.key_pend = 99; D.note8 = D.tgt8 = 36 << 8; D.noise = 22222; D.kF8 = 31 << 8;
+    D.key_pend = 99; D.note8 = D.tgt8 = 36 << 8; D.noise = 22222;
     D.step_len16 = (int32_t)((5011u << 16) + (480u << 16) / 1320u);   /* 132 BPM */
     D.dtime16 = (D.step_len16 >> 8) * 3;
 }

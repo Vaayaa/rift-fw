@@ -32,6 +32,25 @@ static uint32_t fm1_input_edges(uint32_t *released) { uint32_t b = host_edges; h
 static uint32_t fm1_input_note_edges(void) { return 0; }   /* (the script sets fm1_in.notes) */
 static int32_t fm1_enc_take(uint32_t e) { int32_t d = host_enc[e]; host_enc[e] = 0; return d; }
 static void fm1_led_key(uint32_t id, int on) { (void)id; (void)on; }
+static void fm1_led_bg_all(int on) { (void)on; }
+static void fm1_led_glow_key(uint32_t id, int on) { (void)id; (void)on; }
+static volatile uint16_t fm1_led_bg_ns;
+
+/* the second core (hal/fm1_multicore.h): HOST_MC=0 none (stage 2 on core 0), 1 the job at once (before stage 1),
+ * 2 the job at the wait (after stage 1): the same sound all three ways, or stage 2 reads what stage 1 writes */
+static uint8_t fm1_mc_on;
+static int host_mc = -1;
+static void (*host_mc_fn)(uint32_t);
+static uint32_t host_mc_arg;
+static int fm1_mc_run(void (*fn)(uint32_t), uint32_t a)
+{
+    if (host_mc < 0) { const char *e = getenv("HOST_MC"); host_mc = e ? atoi(e) : 0; fm1_mc_on = host_mc > 0; }
+    if (!host_mc) return 0;
+    if (host_mc == 1) fn(a); else { host_mc_fn = fn; host_mc_arg = a; }
+    return 1;
+}
+static int fm1_mc_wait(void) { if (host_mc_fn) { host_mc_fn(host_mc_arg); host_mc_fn = 0; } return 0; }
+static const char *mc_status(void) { return host_mc > 0 ? "2 CORES" : "1 CORE"; }
 
 /* the screen: 240 x 240 RGB565, as the ST7789 gets it (gfx.c sends the bytes swapped) */
 static uint16_t fb[240 * 240];

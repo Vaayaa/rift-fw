@@ -106,9 +106,20 @@ static void fm1_reset_reason(void)
     fm1_boot.wdt_con = fm1_p33_read(FM1_P3_WDT_CON);
 }
 
+/* hold the second core (C1_CON 0x1EEE004: bit 1 holds it, bit 3 lets it run; the SDK's, as Melodee, fm1-x0x and
+ * JIANT 0.6.71 have it): before every reset and update, and first thing at boot, so it never runs over RAM being
+ * cleared or handed back to the boot loader. Harmless when it is not running */
+static inline __attribute__((always_inline)) void fm1_core1_stop(void)
+{
+    *(volatile uint32_t *)0x1EEE004u |= 2u;
+    *(volatile uint32_t *)0x1EEE004u &= ~8u;
+    __asm__ volatile("csync" ::: "memory");
+}
+
 static void fm1_reboot(void)
 {
     __asm__ volatile("cli");
+    fm1_core1_stop();
     fm1_p33_or(FM1_P3_PR_PWR, 0x10);
     for (;;)
         ;
@@ -119,6 +130,7 @@ static void fm1_enter_uboot(void)
     static const char k[16] = "usb_update_mode";
     uint32_t i;
     __asm__ volatile("cli");
+    fm1_core1_stop();
     /* CPU0 write limits (fm1_guard.h) may cover the mailbox: drop them all */
     if (!(*(volatile uint32_t *)0x1EEE240u & 1u))
         *(volatile uint32_t *)0x1EEE240u = 0xE7u;
@@ -132,6 +144,7 @@ static void fm1_enter_uboot(void)
 
 FM1_INLINE void fm1_core_reset(void)
 {
+    fm1_core1_stop();
     FM1_PWR_CON |= 0x10u;
     for (;;)
         ;

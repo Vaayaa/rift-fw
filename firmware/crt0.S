@@ -24,3 +24,16 @@ _start:
 	ssp = _sstack_top
 	call fm1_cstart
 	goto .
+
+/* The second core's entry (hal/fm1_multicore.h puts its address in the word the chip starts core 1 from):
+ * interrupts off and none configured, its own stacks (app.ld: _c1_*), then out of the start-up state into
+ * fm1_c1_main (RAM), which never returns. As the AC79 SDK's startup, Melodee, fm1-x0x and JIANT 0.6.71 have it */
+	.globl fm1_c1_entry
+fm1_c1_entry:
+	cli
+	icfg = 0
+	usp = _c1_ustack_top
+	sp = _c1_sstack_top
+	ssp = _c1_sstack_top
+	reti = fm1_c1_main
+	rti
