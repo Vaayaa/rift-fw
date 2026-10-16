@@ -1,0 +1,24 @@
+# RIFT performance smoke test (btn ids: FX 2, ENV 4, LFO 5, ARP 10, SEQ 11, PLAY 12, REC 13; enc K1..K4 = 2..5)
+1000 btn 12
+1040 btnup 12
+4000 btn 2
+9000 btnup 2
+11000 btn 2
+11020 btn 10
+13500 btnup 10
+13520 btnup 2
+15500 btn 5
+17200 btnup 5
+18000 btn 10
+19500 btnup 10
+21000 enc 5 30
+21500 enc 5 30
+23000 btn 11
+23050 btn 12
+23100 btnup 12
+23150 btnup 11
+24000 btn 11
+24050 btnup 11
+25500 btn 6
+25550 btnup 6
+27000 end
