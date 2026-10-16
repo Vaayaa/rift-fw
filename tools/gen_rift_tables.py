@@ -33,7 +33,7 @@ arr("TANH_T", [round(math.tanh(-8 + i / 64) * Q24) for i in range(1025)])
 # sine over one cycle, 1024 steps, Q24 (+1 guard)
 arr("SIN_T", [round(math.sin(2 * math.pi * i / 1024) * Q24) for i in range(1025)])
 # 2^(k/768), Q30 (1/64 semitone inside an octave)
-arr("EXP2_T", [round(2 ** (k / 768) * Q30) for k in range(769)])
+arr("EXP2_T", [min(2**31 - 1, round(2 ** (k / 768) * Q30)) for k in range(769)])
 # phase increment of C-1 (MIDI 0, 8.1758 Hz) at the core rate FO, as Q32 phase per sample, scaled by 2^8 for precision
 define("INC_C0_OS_Q40", 440 * 2 ** (-69 / 12) / FO * 2 ** 40)
 define("INC_C0_BR_Q40", 440 * 2 ** (-69 / 12) / FS * 2 ** 40)

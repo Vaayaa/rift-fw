@@ -1147,7 +1147,7 @@ static void publish_b(void)
 }
 static void push_undo(void)
 {
-    if (U.nundo == 6) { memmove(&U.undo[0], &U.undo[1], 5 * sizeof(genome_t)); U.nundo = 5; }
+    if (U.nundo == 6) { int k; for (k = 0; k < 5; k++) U.undo[k] = U.undo[k + 1]; U.nundo = 5; }
     U.undo[U.nundo++] = U.g;
     U.gB = U.g; U.hasB = 1; publish_b();
 }
