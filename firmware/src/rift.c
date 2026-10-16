@@ -1211,6 +1211,7 @@ static struct {
     /* drawing caches */
     uint32_t drawn_hash[8]; uint32_t last_frame; int drop_flash, acc_flash, roll_flash, beat_flash, msg_t; const char *msg;
     int last_note; uint32_t last_step_ri; uint32_t clk_sent;
+    int light, light_set; uint32_t cpu_pk, c1_pk, pk_t;   /* key backlight 0..3; CPU peaks (us a block) */
     int lastcc[8];
     int32_t snap[4];
 } U;
@@ -1513,14 +1514,19 @@ static void draw_info_page(void)
             cv_rect(x, y, 55, 34, s_th[t] >= 2 ? C_HEAT : s_th[t] ? C_HEATD : RGB(22, 22, 26));
             cv_text(x + 4, y + 9, &FONT_S, TH_NAME[t], t == T_FREEZE ? C_DIMC : s_th[t] >= 2 ? C_BLACK : C_INK);
         }
-#ifndef DINGHY_HOST
-        num_str(b, (int32_t)(s_cpu * 100u / 5805u));
-#else
-        num_str(b, 0);
-#endif
-        cv_text(4, 104, &FONT_S, "CPU", C_MUTE);
-        cv_text(40, 104, &FONT_S, b, s_cpu > 4000u ? C_HEAT : C_ACID);
-        cv_text(70, 104, &FONT_S, "%", C_MUTE);
+        {   /* the load: core 0 (stage 1 and the wait), core 1 (stage 2), peaks over 2 s */
+            uint32_t c0 = s_cpu, c1 = s_c1;
+            if (c0 > U.cpu_pk) U.cpu_pk = c0;
+            if (c1 > U.c1_pk) U.c1_pk = c1;
+            if (fm1_ms - U.pk_t > 2000u) { U.pk_t = fm1_ms; U.cpu_pk = c0; U.c1_pk = c1; }
+            cv_text(112, 0, &FONT_S, mc_status(), C_MUTE);
+            cv_text(4, 104, &FONT_S, "CPU", C_MUTE);
+            num_str(b, (int32_t)(c0 * 100u / 5805u)); cv_text(40, 104, &FONT_S, b, U.cpu_pk > 4600u ? C_HEAT : C_ACID);
+            num_str(b, (int32_t)(U.cpu_pk * 100u / 5805u)); cv_text(70, 104, &FONT_S, b, C_MUTE);
+            cv_text(104, 104, &FONT_S, "C1", C_MUTE);
+            num_str(b, (int32_t)(c1 * 100u / 5805u)); cv_text(128, 104, &FONT_S, b, U.c1_pk > 4600u ? C_HEAT : C_ACID);
+            num_str(b, (int32_t)(U.c1_pk * 100u / 5805u)); cv_text(158, 104, &FONT_S, b, C_MUTE);
+        }
     }
     (void)b;
     cv_blit(0, 26);
@@ -1659,6 +1665,9 @@ static void button_down(int id)
     case BTN_SEQ: U.seq_used = 0; break;
     case BTN_EDIT: U.page = U.page == PG_VOICE ? PG_FX : PG_VOICE; break;
     case BTN_GLO: P.drums = !P.drums; say(P.drums ? "DRUMS ON" : "DRUMS OFF"); break;
+    case BTN_SEL:   /* the key backlight, on the FX page */
+        if (U.page == PG_FX) { static const char *const LN[4] = {"LIGHT OFF", "LIGHT LOW", "LIGHT MID", "LIGHT HIGH"}; U.light = (U.light + 1) & 3; say(LN[U.light]); }
+        break;
     case BTN_SAVE: settings_store(); break;
     case BTN_REC: U.rec_held = 1; U.ntap = 0; break;
     }
@@ -1760,6 +1769,7 @@ static void app_main(void)
         memcpy(U.slot, SV.slot, sizeof U.slot);
         U.pat = SV.pat & 7;
     }
+    U.light = 2; U.light_set = -1;
     dsp_init();
     dsp_ready = 1;
     genome_init(&U.g, U.slot[U.pat].seed, U.slot[U.pat].type, U.slot[U.pat].dens, U.slot[U.pat].slide, U.slot[U.pat].acc, U.slot[U.pat].scale);
@@ -1834,6 +1844,15 @@ static void app_main(void)
         fm1_led_key(BTN_SEQ, U.page == PG_SEQ); fm1_led_key(BTN_HOME, U.page == PG_PLAY); fm1_led_key(BTN_EDIT, U.page == PG_VOICE || U.page == PG_FX);
         fm1_led_key(BTN_REC, U.rec_held); fm1_led_key(BTN_GLO, P.drums);
         fm1_led_key(BTN_OCT_UP, U.oct > 0); fm1_led_key(BTN_OCT_DOWN, U.oct < 0);
+        if (U.light_set != U.light * 16 + U.oct + 2 + P.root * 64) {   /* the backlight: every key; the root notes and the throws glow */
+            static const uint16_t BG_NS[4] = {0, 700, 1800, 4000};
+            int k;
+            U.light_set = U.light * 16 + U.oct + 2 + P.root * 64;
+            fm1_led_bg_ns = BG_NS[U.light & 3];
+            fm1_led_bg_all(U.light > 0);
+            for (k = 0; k < 27; k++) fm1_led_glow_key(KEY_LED(k), U.light > 0 && (53 + k + 12 * U.oct - P.root + 120) % 12 == 0);
+            for (k = 0; k < 4; k++) fm1_led_glow_key((uint32_t)THROW_BTN[k], U.light > 0);
+        }
         /* screen: ~25 fps for the live parts, the rest on change */
         if (fm1_ms - last_draw >= 40u) {
             last_draw = fm1_ms;

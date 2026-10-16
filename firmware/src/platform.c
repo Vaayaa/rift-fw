@@ -224,9 +224,9 @@ enum { MC_ON, MC_REC, MC_BARRED, MC_NOSTART };
 static uint8_t mc_why = MC_NOSTART;
 static const char *mc_status(void)              /* "2 CORES", or why one */
 {
-    static const char *const LOST[4] = {"1 CORE", "1 CORE BAD READ", "1 CORE NO ANSWER", "1 CORE FAULT"};
+    static const char *const LOST[4] = {"1 CORE", "1 CORE BADREAD", "1 CORE TIMEOUT", "1 CORE FAULT"};
     if (mc_why == MC_ON) return fm1_mc_on ? "2 CORES" : LOST[fm1_mc_lost & 3u];
-    return mc_why == MC_REC ? "1 CORE (REC)" : mc_why == MC_BARRED ? "1 CORE (SINCE FAULT)" : "1 CORE (NO START)";
+    return mc_why == MC_REC ? "1 CORE REC" : mc_why == MC_BARRED ? "1 CORE BARRED" : "1 CORE NOSTART";
 }
 
 /* ---- the sound: ALNK0 I2S, two halves; the app renders, the MASTER knob scales, Q15 -> 24 bit (-6 dBFS ceiling) */

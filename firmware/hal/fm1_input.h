@@ -359,6 +359,33 @@ static uint32_t fm1_input_note_edges(void)
     return p;
 }
 
+/* the backlight on every key and button (on), or none; its brightness is fm1_led_bg_ns */
+static void fm1_led_bg_all(int on)
+{
+    uint32_t p, r;
+    for (p = 0; p < FM1_NCOL; p++) {
+        uint8_t m = 0;
+        for (r = 1; r < 5u; r++)
+            if (on && FM1_KEYMAP[r][p] >= 0)
+                m |= (uint8_t)(1u << r);
+        fm1_led_bg[p] = m;
+    }
+}
+
+/* the glow layer (brighter than the backlight, dimmer than lit) of key id */
+static void fm1_led_glow_key(uint32_t id, int on)
+{
+    uint32_t p, r;
+    for (p = 0; p < FM1_NCOL; p++)
+        for (r = 1; r < 5u; r++)
+            if (FM1_KEYMAP[r][p] == (int8_t)id) {
+                if (on)
+                    fm1_led_dim[p] |= (uint8_t)(1u << r);
+                else
+                    fm1_led_dim[p] &= (uint8_t)~(1u << r);
+            }
+}
+
 /* LED of key id (button 0..13 or note key 14..40) */
 static void fm1_led_key(uint32_t id, int on)
 {
