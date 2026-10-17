@@ -984,6 +984,45 @@ static int32_t log2_24(int32_t x)
     return (n - 24) * ONE16 + f + m16(m16(f, ONE16 - f), 22715);   /* + 0.3466 f (1 - f) */
 }
 
+/* ---------------------------------------------------------------- the memory self-test (0.3.4)
+ * Some FM-1s read RAM wrong now and then while both cores work (Melodee #17 / #21, fm1-x0x #10: hal/fm1_multicore.h).
+ * 2 x 1024 known words (every other one 0, as the reported error: 0x00200000 read where 0 is held), half in the RAM
+ * region, half in the low buffers, read by core 1 after each stage 2 and by core 0 after each stage 1, while the other
+ * core works. A wrong word is read again: right the second time = a read error (the chip); still wrong = the word was
+ * written (a stray write: the firmware), put back */
+#define MT_N 1024u
+static uint32_t mt_a[MT_N];
+static uint32_t mt_b[MT_N] __attribute__((section(".lowbuf")));
+typedef struct { volatile uint32_t blocks, bad, stray, addr, got, want, at_ms; uint32_t pad[9]; } mt_t;
+static mt_t mt_res[2] __attribute__((aligned(64)));   /* [core]: each on cache lines of its own */
+static inline uint32_t mt_pat(uint32_t i) { return (i & 1u) ? 0u : (i * 0x9E3779B1u) ^ 0x5A5A5A5Au; }
+static void mt_fill(void)
+{
+    uint32_t i;
+    for (i = 0; i < MT_N; i++) { mt_a[i] = mt_pat(i); mt_b[i] = mt_pat(i + MT_N); }
+}
+static __attribute__((noinline)) void mt_check(uint32_t core)
+{
+    mt_t *m = &mt_res[core & 1u];
+    uint32_t i;
+    for (i = 0; i < 2u * MT_N; i++) {
+        volatile uint32_t *p = i < MT_N ? &mt_a[i] : &mt_b[i - MT_N];
+        uint32_t want = mt_pat(i), v = *p;
+        if (v != want) {
+            uint32_t v2 = *p;
+            if (!m->bad && !m->stray) { m->addr = (uint32_t)(uintptr_t)p; m->got = v; m->want = want; m->at_ms = fm1_ms; }
+            if (v2 == want) m->bad++;
+            else { m->stray++; *p = want; }
+        }
+    }
+    m->blocks++;
+}
+#ifdef DINGHY_HOST
+static uint32_t mt_core(void) { return 0; }
+#else
+static uint32_t mt_core(void) { return fm1_cnum(); }
+#endif
+
 /* ---------------------------------------------------------------- stage 2 */
 HOT_FN void c1_job(uint32_t b)
 {
@@ -1156,6 +1195,7 @@ HOT_FN void c1_job(uint32_t b)
         out[2u * i] += L >> 9;
         out[2u * i + 1u] += R >> 9;
     }
+    mt_check(mt_core());                            /* the memory self-test: this core, the other working */
 #ifndef DINGHY_HOST
     S2.us = (fm1_mc_ticks() - t0) / FM1_TICKS_PER_US;
 #endif
@@ -1358,6 +1398,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
             G->a1 = D.cab.a1; G->a2 = D.cab.a2; G->a3 = D.cab.a3;
             G->rmb = D.eng == E_RUMBLE ? EP(M_CHR) : 0; G->harm = EP(M_HARM);
             G->ott16 = D.ott16; G->ph16 = EP(M_PHASER); G->apL = D.apL; G->apR = D.apR;
+            if (!fm1_mc_on) { G->ott16 = 0; G->ph16 = 0; G->harm = 0; }   /* one core: no OTT, phaser, harmonics (its budget) */
             G->frz_ev = D.frz_ev; G->frz_len = D.frz_len; D.frz_ev = 0;
             G->frz_mix = m16(P.tp[T_FREEZE][1], ONE16 * 12 / 10) + ONE16 * 4 / 10; G->frz_dry = clampi(P.tp[T_FREEZE][2] * 2, 0, ONE16);
             G->frz_fade = (1 << 30) - (int32_t)((1u << 30) / (uint32_t)(4410 + m16(P.tp[T_FREEZE][3], 84000)));   /* 0.1 .. 2 s */
@@ -1505,6 +1546,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
         }
     }
     if (mc) {
+        mt_check(0);                                /* the memory self-test on core 0, core 1 working beside it */
         if (fm1_mc_wait() < 0) {                    /* core 1 given up (hal/fm1_multicore.h): that block is lost */
 #ifndef DINGHY_HOST
             fm1_mc_bar_set();                       /* one core until power-off */
@@ -1946,7 +1988,15 @@ static void draw_info_page(void)
         if (s_ext) { num_str(b, (s_bpm_ext + 5) / 10); cv_text(70, 0, &FONT_S, "FOLLOWING", C_ACID); cv_text(190, 0, &FONT_S, b, C_ACID); }
         else cv_text(70, 0, &FONT_S, U.sync == 2 ? "WAITING" : "OWN TEMPO", U.sync == 2 ? C_HEAT : C_INK);
         cv_text(4, 40, &FONT_S, "NOTES CC: CH", C_MUTE); num_str(b, U.chan + 1); cv_text(120, 40, &FONT_S, b, C_INK);
-        cv_text(4, 60, &FONT_S, "SEQ+SAVE  SEND DNA", C_MUTE);
+        {   /* the memory self-test (0.3.4): read errors / stray writes, core 0 and core 1; the blocks checked */
+            uint32_t e0 = mt_res[0].bad + mt_res[0].stray, e1 = mt_res[1].bad + mt_res[1].stray;
+            cv_text(4, 60, &FONT_S, "MEM", C_MUTE);
+            num_str(b, (int32_t)mt_res[0].bad); cv_text(44, 60, &FONT_S, b, e0 ? C_HEAT : C_ACID);
+            num_str(b, (int32_t)mt_res[0].stray); cv_text(84, 60, &FONT_S, b, e0 ? C_HEAT : C_ACID);
+            num_str(b, (int32_t)mt_res[1].bad); cv_text(124, 60, &FONT_S, b, e1 ? C_HEAT : C_ACID);
+            num_str(b, (int32_t)mt_res[1].stray); cv_text(164, 60, &FONT_S, b, e1 ? C_HEAT : C_ACID);
+            num_str(b, (int32_t)((mt_res[0].blocks + mt_res[1].blocks) / 1000u)); cv_text(204, 60, &FONT_S, b, C_DIMC);
+        }
         cv_text(4, 80, &FONT_S, U.stems ? "USB AUDIO 8 CH STEMS" : "USB AUDIO STEREO", C_MUTE);
 #ifndef DINGHY_HOST
         if (fm1_crash.magic == FM1_CRASH_MAGIC) {      /* the last crash since power-on: PC, and when after its boot */
@@ -2163,7 +2213,7 @@ static volatile uint8_t crash_q;
 #else
 static void crash_send(void)
 {
-#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 33u)   /* record, 11 more, two breadcrumb sets (n + 32 words each) */
+#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 33u + 14u)   /* record, 11 more, two breadcrumb sets (n + 32 words each), the memory test (2 x 7) */
     static uint8_t f[6u + CW * 8u + 1u];
     static uint32_t w[CW];
     uint32_t n = 0, i, k, o = sizeof(fm1_crash_t) / 4u;
@@ -2172,11 +2222,15 @@ static void crash_send(void)
     w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_lost << 8 | (uint32_t)fm1_mc_on << 16;
     memcpy(&w[o], &fm1_mc_bar, 8u); o += 2u;
     memcpy(&w[o], &bootguard, 12u); o += 3u;
-    w[o++] = 0x00000303u;                                   /* this build: 0.3.3 */
+    w[o++] = 0x00000304u;                                   /* this build: 0.3.4 */
     w[o++] = crumbs_crash.magic == CRUMB_MAGIC ? crumbs_crash.n : 0xFFFFFFFFu;
     memcpy(&w[o], crumbs_crash.e, 128u); o += 32u;
     w[o++] = crumbs.n;
     memcpy(&w[o], crumbs.e, 128u); o += 32u;
+    for (i = 0; i < 2u; i++) {
+        w[o++] = mt_res[i].blocks; w[o++] = mt_res[i].bad; w[o++] = mt_res[i].stray; w[o++] = mt_res[i].addr;
+        w[o++] = mt_res[i].got; w[o++] = mt_res[i].want; w[o++] = mt_res[i].at_ms;
+    }
     if (o != CW) { say("LOG SIZE BUG"); return; }        /* (sizes above: the buffers must match) */
     f[n++] = 0xF0; f[n++] = 0x7D; f[n++] = 'R'; f[n++] = 'C'; f[n++] = 2;
     for (i = 0; i < o; i++)
@@ -2359,6 +2413,7 @@ static void app_main(void)
     P.sync = U.sync;
     if (U.stems) usb_stems_set(1);              /* (USB re-enumerates once, as the stems' device) */
     dsp_init();
+    mt_fill();
     dsp_ready = 1;
     genome_init(&U.g, U.slot[U.pat].seed, U.slot[U.pat].type, U.slot[U.pat].dens, U.slot[U.pat].slide, U.slot[U.pat].acc, U.slot[U.pat].scale);
     if (U.slot[U.pat].gen) { U.g.gen = U.slot[U.pat].gen; generate(&U.g); }
