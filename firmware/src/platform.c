@@ -293,13 +293,26 @@ void fm1_timer5_irq(void)
 extern void isr_timer5(void);
 
 /* ---- the second core's state for the app (hal/fm1_multicore.h): why it runs or not */
-enum { MC_ON, MC_REC, MC_BARRED, MC_NOSTART };
+enum { MC_ON, MC_REC, MC_BARRED, MC_NOSTART, MC_OFF };   /* MC_OFF: one core by choice (SYS, RIFT 0.4) */
 static uint8_t mc_why = MC_NOSTART;
 static const char *mc_status(void)              /* "2 CORES", or why one */
 {
     static const char *const LOST[4] = {"1 CORE", "1 CORE BADREAD", "1 CORE TIMEOUT", "1 CORE FAULT"};
     if (mc_why == MC_ON) return fm1_mc_on ? "2 CORES" : LOST[fm1_mc_lost & 3u];
-    return mc_why == MC_REC ? "1 CORE REC" : mc_why == MC_BARRED ? "1 CORE BARRED" : "1 CORE NOSTART";
+    return mc_why == MC_OFF ? "1 CORE" : mc_why == MC_REC ? "1 CORE REC" : mc_why == MC_BARRED ? "1 CORE BARRED" : "1 CORE NOSTART";
+}
+
+/* the app, after its settings, before its render starts: the second core. Its entry word is in the protected top of
+ * RAM: opened for it, interrupts off (up to 20 ms) */
+static void mc_start_dual(void)
+{
+    if (mc_why != MC_OFF)
+        return;
+    fm1_irq_off();
+    fm1_guard_unlock_top();
+    mc_why = fm1_mc_start() ? MC_ON : MC_NOSTART;
+    fm1_guard_lock_top();
+    fm1_irq_on();
 }
 
 /* ---- the sound: ALNK0 I2S, two halves; the app renders, the MASTER knob scales, Q15 -> 24 bit (-6 dBFS ceiling) */
@@ -322,6 +335,7 @@ void fm1_alnk0_irq(void)                       /* via isr_alnk0 (hal/fm1_isr.S) 
             o[i] = 0;
         uac_render_start();
         app_audio(o, HALF_FRAMES);
+        uac_render_end();
         for (i = 0; i < HALF_WORDS; i++) {
             int32_t v = (o[i] * master_q12) >> 12;
             o[i] = v > 32767 ? 32767 : v < -32767 ? -32767 : v;
@@ -448,21 +462,16 @@ void fm1_cstart(void)
     fm1_timer5_start(isr_timer5, 4);
     fm1_guard_lock_top();
     fm1_irq_enable_all();
-    /* the second core (hal/fm1_multicore.h), unless REC is held at power-on (one core this session), a boot is being
-     * retried, or it was given up / beside a crash since power-on. Its entry word is in the protected top of RAM:
-     * opened for it, interrupts off (up to 20 ms) */
+    /* the second core (hal/fm1_multicore.h): only when the app asks (SYS > SELECT, RIFT 0.4: one core by default, some
+     * FM-1s read RAM wrong with both working), and never when REC is held at power-on or it was given up / beside a
+     * crash since power-on (mc_start_dual) */
     fm1_delay_ms(30);
     if ((fm1_in.buttons >> BTN_REC) & 1u)
         mc_why = MC_REC;
     else if (fm1_mc_barred())
         mc_why = MC_BARRED;
-    else {
-        fm1_irq_off();
-        fm1_guard_unlock_top();
-        mc_why = fm1_mc_start() ? MC_ON : MC_NOSTART;
-        fm1_guard_lock_top();
-        fm1_irq_on();
-    }
+    else
+        mc_why = MC_OFF;
     app_main();
     for (;;)
         platform_poll();

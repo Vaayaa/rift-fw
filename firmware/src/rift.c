@@ -993,12 +993,19 @@ static int32_t log2_24(int32_t x)
 #define MT_N 1024u
 static uint32_t mt_a[MT_N];
 static uint32_t mt_b[MT_N] __attribute__((section(".lowbuf")));
-typedef struct { volatile uint32_t blocks, bad, stray, addr, got, want, at_ms; uint32_t pad[9]; } mt_t;
-static mt_t mt_res[2] __attribute__((aligned(64)));   /* [core]: each on cache lines of its own */
+typedef struct { volatile uint32_t blocks, bad, stray, addr, got, want, at_ms; uint32_t magic, pad[8]; } mt_t;
+#define MT_MAGIC 0x4D544553u
+/* [core]: each on cache lines of its own; in .noinit (0.4): a crash's reboot keeps the run's results, as mt_prev */
+mt_t mt_res[2] __attribute__((section(".noinit"), aligned(64)));
+mt_t mt_prev[2] __attribute__((section(".noinit"), aligned(64)));
 static inline uint32_t mt_pat(uint32_t i) { return (i & 1u) ? 0u : (i * 0x9E3779B1u) ^ 0x5A5A5A5Au; }
 static void mt_fill(void)
 {
     uint32_t i;
+    if (mt_res[0].magic == MT_MAGIC) memcpy(mt_prev, mt_res, sizeof mt_prev);   /* the run before (a crash, an update) */
+    else memset(mt_prev, 0, sizeof mt_prev);
+    memset(mt_res, 0, sizeof mt_res);
+    mt_res[0].magic = mt_res[1].magic = MT_MAGIC;
     for (i = 0; i < MT_N; i++) { mt_a[i] = mt_pat(i); mt_b[i] = mt_pat(i + MT_N); }
 }
 static __attribute__((noinline)) void mt_check(uint32_t core)
@@ -1201,7 +1208,7 @@ HOT_FN void c1_job(uint32_t b)
         out[2u * i] += L >> 9;
         out[2u * i + 1u] += R >> 9;
     }
-    mt_check(mt_core());                            /* the memory self-test: this core, the other working */
+    if (fm1_mc_on) mt_check(mt_core());             /* the memory self-test: this core, the other working (two cores only) */
 #ifndef DINGHY_HOST
     S2.us = (fm1_mc_ticks() - t0) / FM1_TICKS_PER_US;
 #endif
@@ -1265,6 +1272,7 @@ static void ext_clock(void)
 }
 
 /* ---------------------------------------------------------------- the audio ISR */
+static int lite_lv; static uint32_t lite_ok;      /* the load governor: optional effects resting (0..3) */
 HOT_FN void app_audio(int32_t *out, uint32_t n)
 {
 #ifndef DINGHY_HOST
@@ -1315,6 +1323,13 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
         }
     }
     if (!dsp_ready) return;
+    {   /* the load governor (0.4): the last block took over 83 % of its time -> one optional effect more rests (at once);
+         * 2 s under 65 % -> one comes back. No crackle on one core, the effects whenever they fit */
+        uint32_t ld = (uint32_t)s_cpu;
+        if (ld > 4800u) { if (lite_lv < 3) lite_lv++; lite_ok = 0; }
+        else if (ld < 3800u) { if (lite_lv && ++lite_ok >= 344u) { lite_lv--; lite_ok = 0; } }
+        else lite_ok = 0;
+    }
     {
         uint32_t bpm = (uint32_t)clampi(P.bpm10, 600, 2000), num = FS * 600u / 4u, q = num / bpm, r = num - q * bpm;
         D.step_len16 = (int32_t)((q << 16) + (r << 16) / bpm);
@@ -1404,7 +1419,9 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
             G->a1 = D.cab.a1; G->a2 = D.cab.a2; G->a3 = D.cab.a3;
             G->rmb = D.eng == E_RUMBLE ? EP(M_CHR) : 0; G->harm = EP(M_HARM);
             G->ott16 = D.ott16; G->ph16 = EP(M_PHASER); G->apL = D.apL; G->apR = D.apR;
-            if (!fm1_mc_on) { G->ott16 = 0; G->ph16 = 0; G->harm = 0; }   /* one core: no OTT, phaser, harmonics (its budget) */
+            if (lite_lv >= 1) G->ph16 = 0;           /* the load governor (0.4): the phaser, then OTT, then HARM rest */
+            if (lite_lv >= 2) G->ott16 = 0;
+            if (lite_lv >= 3) G->harm = 0;
             G->frz_ev = D.frz_ev; G->frz_len = D.frz_len; D.frz_ev = 0;
             G->frz_mix = m16(P.tp[T_FREEZE][1], ONE16 * 12 / 10) + ONE16 * 4 / 10; G->frz_dry = clampi(P.tp[T_FREEZE][2] * 2, 0, ONE16);
             G->frz_fade = (1 << 30) - (int32_t)((1u << 30) / (uint32_t)(4410 + m16(P.tp[T_FREEZE][3], 84000)));   /* 0.1 .. 2 s */
@@ -1619,6 +1636,7 @@ static struct {
     uint32_t mo_next;                     /* motion: the lane to replace next */
     __typeof__(((genome_t *)0)->mo) mot[8];   /* each slot's motion */
     int chan, sync, stems;                /* MIDI channel - 1; SYNC 0 INT 1 AUTO 2 EXT; USB audio 0 stereo 1 stems */
+    int dual;                             /* SYS > SELECT: the second core from the next power-on (0.4: off by default) */
     int fxl;                              /* the FX page's knobs: 0 SEND FBACK SUB DUCK, 1 PHASR RATE SQUASH HARM */
     int light, light_set; uint32_t cpu_pk, c1_pk, pk_t, sel_t, dice_n;
     int32_t dice_mem[16]; int has_dice;   /* the sound before the last dice */   /* key backlight 0..3; CPU peaks (us a block) */
@@ -1759,7 +1777,7 @@ static void settings_store(void)
 {
     crumb('W', 0, 0);
     SV.phaser = (uint16_t)clampi(P.phaser, 0, 65535); SV.ph_rate = (uint16_t)clampi(P.ph_rate, 0, 65535); SV.squash = (uint16_t)clampi(P.squash, 0, 65535);
-    SV.chan = (uint16_t)((U.chan & 15) | (U.sync & 3) << 4 | (U.stems & 1) << 6);
+    SV.chan = (uint16_t)((U.chan & 15) | (U.sync & 3) << 4 | (U.stems & 1) << 6 | (U.dual & 1) << 8);
     SV.ver = 5; SV.eng = (uint8_t)P.eng; SV.ratio = (uint8_t)P.ratio; SV.rel = (uint8_t)P.rel; SV.light = (uint8_t)(U.light + 1);
     SV.fold = (uint16_t)clampi(P.fold, 0, 65535); SV.formant = (uint16_t)clampi(P.formant, 0, 65535); SV.harm = (uint16_t)clampi(P.harm, 0, 65535);
     SV.preset = (uint8_t)U.preset; SV.pat = (uint8_t)U.pat; SV.drums = (uint8_t)P.drums;
@@ -2012,6 +2030,7 @@ static void draw_info_page(void)
 #endif
         cv_text(4, 20, &FONT_S, "IN: USB + TRS JACK", C_MUTE);
         cv_text(4, 104, &FONT_S, mc_status(), C_DIMC);
+        cv_text(150, 104, &FONT_S, U.dual ? "SET 2" : "SET 1", U.dual ? C_HEAT : C_DIMC);   /* SELECT: from the next power-on */
     } else {
         int t;
         cv_text(4, 0, &FONT_S, "DELAY", C_MUTE);
@@ -2034,6 +2053,7 @@ static void draw_info_page(void)
             cv_text(104, 104, &FONT_S, "C1", C_MUTE);
             num_str(b, (int32_t)(c1 * 100u / 5805u)); cv_text(128, 104, &FONT_S, b, U.c1_pk > 4600u ? C_HEAT : C_ACID);
             num_str(b, (int32_t)(U.c1_pk * 100u / 5805u)); cv_text(158, 104, &FONT_S, b, C_MUTE);
+            if (lite_lv) { char lb[4] = {'L', 'T', (char)('0' + lite_lv), 0}; cv_text(204, 104, &FONT_S, lb, C_HEAT); }
         }
     }
     (void)b;
@@ -2230,7 +2250,7 @@ static volatile uint8_t crash_q;
 #else
 static void crash_send(void)
 {
-#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 33u + 14u + 12u)   /* record, 11 more, two breadcrumb sets (n + 32 words each), the memory test (2 x 7), USB audio (12) */
+#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 33u + 14u + 12u + 14u)   /* record, 11 more, two breadcrumb sets (n + 32 words each), the memory test (2 x 7), USB audio (12), the run before's memory test (2 x 7) */
     static uint8_t f[6u + CW * 8u + 1u];
     static uint32_t w[CW];
     uint32_t n = 0, i, k, o = sizeof(fm1_crash_t) / 4u;
@@ -2239,7 +2259,7 @@ static void crash_send(void)
     w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_lost << 8 | (uint32_t)fm1_mc_on << 16;
     memcpy(&w[o], &fm1_mc_bar, 8u); o += 2u;
     memcpy(&w[o], &bootguard, 12u); o += 3u;
-    w[o++] = 0x00000306u;                                   /* this build: 0.3.6 */
+    w[o++] = 0x00000400u;                                   /* this build: 0.4 */
     w[o++] = crumbs_crash.magic == CRUMB_MAGIC ? crumbs_crash.n : 0xFFFFFFFFu;
     memcpy(&w[o], crumbs_crash.e, 128u); o += 32u;
     w[o++] = crumbs.n;
@@ -2252,7 +2272,11 @@ static void crash_send(void)
      * packets, the ring's fill range, starts, alt | flowing << 8 | go << 16 | stems << 24 */
     w[o++] = uac.pkts; w[o++] = uac.frames; w[o++] = uac.underruns; w[o++] = uac.overruns; w[o++] = uac.missed;
     w[o++] = uac.stalls; w[o++] = uac.adj_up; w[o++] = uac.adj_down; w[o++] = uac.fill_lo; w[o++] = uac.fill_hi;
-    w[o++] = uac.starts; w[o++] = (uint32_t)uac.alt | (uint32_t)uac.flowing << 8 | (uint32_t)uac.go << 16 | (uint32_t)usb_stems << 24;
+    w[o++] = uac.starts | uac.rend << 16; w[o++] = (uint32_t)uac.alt | (uint32_t)uac.flowing << 8 | (uint32_t)uac.go << 16 | (uint32_t)usb_stems << 24;
+    for (i = 0; i < 2u; i++) {
+        w[o++] = mt_prev[i].blocks; w[o++] = mt_prev[i].bad; w[o++] = mt_prev[i].stray; w[o++] = mt_prev[i].addr;
+        w[o++] = mt_prev[i].got; w[o++] = mt_prev[i].want; w[o++] = mt_prev[i].at_ms;
+    }
     if (o != CW) { say("LOG SIZE BUG"); return; }        /* (sizes above: the buffers must match) */
     f[n++] = 0xF0; f[n++] = 0x7D; f[n++] = 'R'; f[n++] = 'C'; f[n++] = 2;
     for (i = 0; i < o; i++)
@@ -2423,7 +2447,7 @@ static void app_main(void)
         U.pat = SV.pat & 7;
         if (SV.ver == 5) {
             P.phaser = SV.phaser; P.ph_rate = SV.ph_rate; P.squash = SV.squash;
-            U.chan = SV.chan & 15; U.sync = (SV.chan >> 4) & 3; U.stems = (SV.chan >> 6) & 1;
+            U.chan = SV.chan & 15; U.sync = (SV.chan >> 4) & 3; U.stems = (SV.chan >> 6) & 1; U.dual = (SV.chan >> 8) & 1;
             memcpy(U.mot, SV.mo, sizeof U.mot);
         }
         if (SV.ver >= 4) {
@@ -2434,6 +2458,7 @@ static void app_main(void)
     U.light_set = -1;
     P.sync = U.sync;
     if (U.stems) usb_stems_set(1);              /* (USB re-enumerates once, as the stems' device) */
+    if (U.dual) mc_start_dual();                /* (before the render starts: dsp_ready below) */
     dsp_init();
     mt_fill();
     dsp_ready = 1;
@@ -2483,6 +2508,7 @@ static void app_main(void)
                 if (U.page == PG_SEQ) { U.g.scale = (uint8_t)((U.g.scale + (d > 0 ? 1 : 9)) % 10); P.scale = U.g.scale; generate(&U.g); save_slot(); publish(0); }
                 else if (U.page == PG_FX) P.dly_time = clampi(P.dly_time + (d > 0 ? 1 : -1), 0, 4);
                 else if (U.page == PG_VOICE) { P.eng = (P.eng + (d > 0 ? 1 : NENG - 1)) % NENG; say(ENG_NAME[P.eng]); }
+                else if (U.page == PG_SYS) { U.dual = d > 0; say(U.dual ? "2 CORES AT NEXT POWER-ON" : "1 CORE AT NEXT POWER-ON"); }
                 else P.bpm10 = clampi(P.bpm10 + d * 10, 600, 2000);
                 break;
             case ENC_ALGORITHM: load_preset(U.preset + (d > 0 ? 1 : -1)); break;
