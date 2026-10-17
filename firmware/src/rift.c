@@ -704,6 +704,7 @@ static int32_t lane_pure(int l, uint32_t c)
 static int chance_ok(uint32_t a)
 {
     int32_t v = clampi(lane_pure(L_CHN, a), 0, 7);
+    if (!v) return 1;                               /* 100 %: always (0.4.1: 255 / 256 dropped one note in 256) */
     return (hash32(GA()->seed ^ 28679u ^ ((a + 3u) * 0x27d4eb2du)) >> 24) < CHANCE[v];
 }
 static int32_t rhy_at(uint32_t a, uint32_t *idx)
@@ -2259,7 +2260,7 @@ static void crash_send(void)
     w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_lost << 8 | (uint32_t)fm1_mc_on << 16;
     memcpy(&w[o], &fm1_mc_bar, 8u); o += 2u;
     memcpy(&w[o], &bootguard, 12u); o += 3u;
-    w[o++] = 0x00000400u;                                   /* this build: 0.4 */
+    w[o++] = 0x00000401u;                                   /* this build: 0.4.1 */
     w[o++] = crumbs_crash.magic == CRUMB_MAGIC ? crumbs_crash.n : 0xFFFFFFFFu;
     memcpy(&w[o], crumbs_crash.e, 128u); o += 32u;
     w[o++] = crumbs.n;
