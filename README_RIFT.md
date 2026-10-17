@@ -1,4 +1,4 @@
-# RIFT 裂 · FM-1 贝斯固件 v0.3.5
+# RIFT 裂 · FM-1 贝斯固件 v0.4
 
 Mr.V / PUZAOSI。基于 Dinghy（zvenson）、Felucca（Leo Kuroshita, Hügelton Instruments）和 SLOOP（isod89），GPL-3.0。
 
@@ -80,7 +80,10 @@ python3 tools/fm1_install.py build/rift-0.3.fwsc   # 写入前会先询问确认
 
 按下后在下一步把刚刚 2 / 4 / 8 步的高频段（爆 之后）冻住循环，抬起后按 4 步量化落地并淡出。按住时 K1 LEN 长度 · K2 LOOP 循环音量 · K3 LIVE 现场声部音量（拧到 0 只听循环）· K4 FADE 淡出时间。双击锁定。
 
-## 双核
+## 双核（0.4 起默认关闭）
+
+0.4 起默认单核：这台测试机在双核满负荷时出现过寄存器被改坏的崩溃（与 Melodee #17 / fm1-x0x #10 记录的硬件问题一致）。SYS 页拧 SELECT 选 SET 2，下次上电起用双核。单核时由负载调节器在 CPU 超过 83% 时依次暂停相位器、OTT、HARM，2 秒低于 65% 再恢复（FX 页显示 LT1–3）。
+
 
 AC791N 的第二个核负责爆之后的所有处理（降采样、箱体、crush、延迟、参考鼓、总线、tape stop）。输出因此晚一个块（5.8 ms）。开机时按住 REC：本次只用一个核（声音完全一样，只是没有那 5.8 ms）。第二个核出错会自动停掉、退回单核，FX 页右上角会显示原因；双核时崩溃过，直到断电前都用单核（1 CORE BARRED）。单核时 OTT、相位器、HARM 自动关闭。SYS 页的 MEM 行是双核内存自检（核心 0 读错 / 乱写、核心 1 读错 / 乱写、检查批数），CRASH 行显示本次上电后最近一次崩溃。双核的启动和防护方式来自 Melodee、fm1-x0x 和 JIANT（GPL-3.0）。
 
