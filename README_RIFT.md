@@ -1,4 +1,4 @@
-# RIFT 裂 · FM-1 贝斯固件 v0.3
+# RIFT 裂 · FM-1 贝斯固件 v0.3.5
 
 Mr.V / PUZAOSI。基于 Dinghy（zvenson）、Felucca（Leo Kuroshita, Hügelton Instruments）和 SLOOP（isod89），GPL-3.0。
 
@@ -51,7 +51,7 @@ python3 tools/fm1_install.py build/rift-0.3.fwsc   # 写入前会先询问确认
 | VOICE 页：SEL 按键 | 音色骰子：按引擎各自的好听范围随机一个音色；长按 0.6 秒撤销 |
 | FX 页：SEL 按键 | 旋钮切第二层：PHASR 相位器量 · RATE 速度 · SQUASH OTT 深度 · HARM 低频谐波 |
 | SYS 页 K1–K4 | SYNC 时钟 INT/AUTO/EXT · CH 本机 MIDI 通道 · USB 立体声/8 轨分轨 · LIGHT 按键背光 |
-| REC 按住 + 拧 K1–K4（播放中） | 动作录制：每一步记下旋钮值，跟着 pattern 循环回放（旋钮上出现小方块）；REC + HOME 清除 |
+| REC 按住 + 拧 K1–K4（播放中） | 动作录制：每一步记下旋钮值，跟着 pattern 循环回放（旋钮上出现小方块，数值跟着实际播放的值变化）；REC + HOME 清除 |
 | SEQ 按住 + SAVE | 把当前 pattern 的 DNA 发给其他 RIFT（USB MIDI SysEx），对方下一小节换上 |
 | GLO | 参考鼓开 / 关 |
 | SAVE | 存储音色和 8 个音序槽的 DNA |
@@ -82,7 +82,7 @@ python3 tools/fm1_install.py build/rift-0.3.fwsc   # 写入前会先询问确认
 
 ## 双核
 
-AC791N 的第二个核负责爆之后的所有处理（降采样、箱体、crush、延迟、参考鼓、总线、tape stop）。输出因此晚一个块（5.8 ms）。开机时按住 REC：本次只用一个核（声音完全一样，只是没有那 5.8 ms）。第二个核出错会自动停掉、退回单核，FX 页右上角会显示原因。双核的启动和防护方式来自 Melodee、fm1-x0x 和 JIANT（GPL-3.0）。
+AC791N 的第二个核负责爆之后的所有处理（降采样、箱体、crush、延迟、参考鼓、总线、tape stop）。输出因此晚一个块（5.8 ms）。开机时按住 REC：本次只用一个核（声音完全一样，只是没有那 5.8 ms）。第二个核出错会自动停掉、退回单核，FX 页右上角会显示原因；双核时崩溃过，直到断电前都用单核（1 CORE BARRED）。单核时 OTT、相位器、HARM 自动关闭。SYS 页的 MEM 行是双核内存自检（核心 0 读错 / 乱写、核心 1 读错 / 乱写、检查批数），CRASH 行显示本次上电后最近一次崩溃。双核的启动和防护方式来自 Melodee、fm1-x0x 和 JIANT（GPL-3.0）。
 
 ## B 组效果（SEL 换组）
 
