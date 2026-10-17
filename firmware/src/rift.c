@@ -2163,7 +2163,7 @@ static volatile uint8_t crash_q;
 #else
 static void crash_send(void)
 {
-#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 17u)
+#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 33u)   /* record, 11 more, two breadcrumb sets (n + 32 words each) */
     static uint8_t f[6u + CW * 8u + 1u];
     static uint32_t w[CW];
     uint32_t n = 0, i, k, o = sizeof(fm1_crash_t) / 4u;
@@ -2172,11 +2172,12 @@ static void crash_send(void)
     w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_lost << 8 | (uint32_t)fm1_mc_on << 16;
     memcpy(&w[o], &fm1_mc_bar, 8u); o += 2u;
     memcpy(&w[o], &bootguard, 12u); o += 3u;
-    w[o++] = 0x00000302u;                                   /* this build: 0.3.2 */
+    w[o++] = 0x00000303u;                                   /* this build: 0.3.3 */
     w[o++] = crumbs_crash.magic == CRUMB_MAGIC ? crumbs_crash.n : 0xFFFFFFFFu;
     memcpy(&w[o], crumbs_crash.e, 128u); o += 32u;
     w[o++] = crumbs.n;
     memcpy(&w[o], crumbs.e, 128u); o += 32u;
+    if (o != CW) { say("LOG SIZE BUG"); return; }        /* (sizes above: the buffers must match) */
     f[n++] = 0xF0; f[n++] = 0x7D; f[n++] = 'R'; f[n++] = 'C'; f[n++] = 2;
     for (i = 0; i < o; i++)
         for (k = 0; k < 8u; k++) f[n++] = (uint8_t)((w[i] >> (28u - 4u * k)) & 15u);
