@@ -1,0 +1,18 @@
+# stems at full BURST: EDIT x3 -> SYS, K3 (enc 4) -> STEMS, HOME, PLAY, BURST (enc 5) all the way, throws
+500 btn 6
+520 btnup 6
+600 btn 6
+620 btnup 6
+700 btn 6
+720 btnup 6
+800 enc 4 1
+900 btn 8
+920 btnup 8
+1000 btn 12
+1040 btnup 12
+1200 enc 5 80
+3000 btn 2
+6000 btnup 2
+7000 btn 5
+9000 btnup 5
+10000 end

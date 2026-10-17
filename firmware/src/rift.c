@@ -1023,6 +1023,12 @@ static uint32_t mt_core(void) { return 0; }
 static uint32_t mt_core(void) { return fm1_cnum(); }
 #endif
 
+/* a stem for USB: the master's ceiling (x the volume, tanh, -1 dBFS), Q24 -> Q15 */
+static inline int16_t stem16(int32_t x, int32_t v)
+{
+    return (int16_t)clampi(m16(tanh24(m16(m16(x, v), 73550)), 58395) >> 9, -32767, 32767);
+}
+
 /* ---------------------------------------------------------------- stage 2 */
 HOT_FN void c1_job(uint32_t b)
 {
@@ -1160,9 +1166,9 @@ HOT_FN void c1_job(uint32_t b)
             if (usb_stems) {   /* SYS > USB STEMS: bass, drums, delay return, at the volume, before the master's ceiling */
                 int16_t *q = &stem_q[6u * i];
                 int32_t bl = m16(low + hL, B->bg[i]), br = m16(low + hR, B->bg[i]), v = P.vol;
-                q[0] = (int16_t)clampi(m16(bl, v) >> 9, -32767, 32767); q[1] = (int16_t)clampi(m16(br, v) >> 9, -32767, 32767);
-                q[2] = (int16_t)clampi(m16(dl, v) >> 9, -32767, 32767); q[3] = (int16_t)clampi(m16(dr, v) >> 9, -32767, 32767);
-                q[4] = (int16_t)clampi(m16(L - bl, v) >> 9, -32767, 32767); q[5] = (int16_t)clampi(m16(R - br, v) >> 9, -32767, 32767);
+                /* each pair through the master's soft ceiling (-1 dBFS), as channels 1-2 are: hot sounds saturate, never clip */
+                q[0] = stem16(bl, v); q[1] = stem16(br, v); q[2] = stem16(dl, v); q[3] = stem16(dr, v);
+                q[4] = stem16(L - bl, v); q[5] = stem16(R - br, v);
             }
             L += dl; R += dr;
         }
@@ -2224,7 +2230,7 @@ static volatile uint8_t crash_q;
 #else
 static void crash_send(void)
 {
-#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 33u + 14u)   /* record, 11 more, two breadcrumb sets (n + 32 words each), the memory test (2 x 7) */
+#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 33u + 14u + 12u)   /* record, 11 more, two breadcrumb sets (n + 32 words each), the memory test (2 x 7), USB audio (12) */
     static uint8_t f[6u + CW * 8u + 1u];
     static uint32_t w[CW];
     uint32_t n = 0, i, k, o = sizeof(fm1_crash_t) / 4u;
@@ -2233,7 +2239,7 @@ static void crash_send(void)
     w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_lost << 8 | (uint32_t)fm1_mc_on << 16;
     memcpy(&w[o], &fm1_mc_bar, 8u); o += 2u;
     memcpy(&w[o], &bootguard, 12u); o += 3u;
-    w[o++] = 0x00000305u;                                   /* this build: 0.3.5 */
+    w[o++] = 0x00000306u;                                   /* this build: 0.3.6 */
     w[o++] = crumbs_crash.magic == CRUMB_MAGIC ? crumbs_crash.n : 0xFFFFFFFFu;
     memcpy(&w[o], crumbs_crash.e, 128u); o += 32u;
     w[o++] = crumbs.n;
@@ -2242,6 +2248,11 @@ static void crash_send(void)
         w[o++] = mt_res[i].blocks; w[o++] = mt_res[i].bad; w[o++] = mt_res[i].stray; w[o++] = mt_res[i].addr;
         w[o++] = mt_res[i].got; w[o++] = mt_res[i].want; w[o++] = mt_res[i].at_ms;
     }
+    /* the USB audio stream's counters (usb.c): packets, frames, underruns, overruns, missed, stalls, +1 / -1 frame
+     * packets, the ring's fill range, starts, alt | flowing << 8 | go << 16 | stems << 24 */
+    w[o++] = uac.pkts; w[o++] = uac.frames; w[o++] = uac.underruns; w[o++] = uac.overruns; w[o++] = uac.missed;
+    w[o++] = uac.stalls; w[o++] = uac.adj_up; w[o++] = uac.adj_down; w[o++] = uac.fill_lo; w[o++] = uac.fill_hi;
+    w[o++] = uac.starts; w[o++] = (uint32_t)uac.alt | (uint32_t)uac.flowing << 8 | (uint32_t)uac.go << 16 | (uint32_t)usb_stems << 24;
     if (o != CW) { say("LOG SIZE BUG"); return; }        /* (sizes above: the buffers must match) */
     f[n++] = 0xF0; f[n++] = 0x7D; f[n++] = 'R'; f[n++] = 'C'; f[n++] = 2;
     for (i = 0; i < o; i++)

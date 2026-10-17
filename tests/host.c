@@ -54,6 +54,7 @@ static void crumb(uint32_t c, uint32_t a, uint32_t b) { (void)c; (void)a; (void)
 static const char *mc_status(void) { return host_mc > 0 ? "2 CORES" : "1 CORE"; }
 static volatile uint8_t usb_stems;
 static int16_t stem_q[HALF_FRAMES * 6u];
+static int32_t stem_pk[6]; static uint32_t stem_rail[6];
 static void usb_stems_set(uint32_t on) { usb_stems = (uint8_t)(on != 0); printf("%6u ms  USB re-enumerates: %s\n", fm1_ms, on ? "8 ch stems" : "stereo"); }
 
 /* the screen: 240 x 240 RGB565, as the ST7789 gets it (gfx.c sends the bytes swapped) */
@@ -256,6 +257,15 @@ static void platform_poll(void)                 /* one call = one millisecond */
         owed -= 1000u * HALF_FRAMES;
         memset(blk, 0, sizeof blk);
         app_audio(blk, HALF_FRAMES);
+        if (getenv("HOST_STEMS")) usb_stems = 1;
+        if (usb_stems) {                        /* the stems' level: peaks and samples at the rail (HOST_STEMS report at the end) */
+            uint32_t k;
+            for (k = 0; k < HALF_FRAMES * 6u; k++) {
+                int32_t a = stem_q[k] < 0 ? -stem_q[k] : stem_q[k];
+                if (a > stem_pk[k % 6u]) stem_pk[k % 6u] = a;
+                if (a >= 32700) stem_rail[k % 6u]++;
+            }
+        }
         wav = realloc(wav, (wav_n + HALF_FRAMES) * 4u);
         for (i = 0; i < 2u * HALF_FRAMES; i++) {
             int32_t v = blk[i];                 /* (USB audio at the MASTER knob all the way up) */
@@ -272,6 +282,7 @@ static void platform_poll(void)                 /* one call = one millisecond */
     } else if (shot < sizeof SHOT / sizeof SHOT[0] && fm1_ms == SHOT[shot])
         write_ppm(SHOT[shot++]);
     if (fm1_ms >= end_ms) {
+        if (usb_stems) { int c; printf("stems peak/rail:"); for (c = 0; c < 6; c++) printf(" %d/%u", stem_pk[c], stem_rail[c]); printf("\n"); }
         write_wav();
         exit(0);
     }
