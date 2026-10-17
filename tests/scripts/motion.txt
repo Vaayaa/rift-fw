@@ -1,0 +1,10 @@
+# motion record: play, hold REC, turn K1 (CUT) down then up across steps, release; the CUT shown must follow
+1000 btn 12
+1040 btnup 12
+2000 btn 13
+2100 enc 2 -40
+2600 enc 2 30
+3100 enc 2 -20
+3600 enc 2 25
+4000 btnup 13
+9000 end

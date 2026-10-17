@@ -2059,6 +2059,16 @@ static volatile int32_t *knob_ptr(int i, int *kind)
     default: { volatile int32_t *p[4] = {&P.cut, &P.res, &P.env, &P.burst}; return p[i]; }
     }
 }
+/* what a knob shows: the value playing. A recorded motion's value for this step over the knob's own (while playing; while
+ * REC is held the knob itself, as it is being recorded) */
+static int32_t knob_eff(volatile int32_t *p)
+{
+    int m = p ? mp_of(p) : -1;
+    int32_t v;
+    if (m < 0) return p ? *p : 0;
+    v = lk[m];
+    return v >= 0 && s_playing && !U.rec_held ? v : *p;
+}
 static int knob_page(knob_t *k)
 {
     static const char *const LB[4][4] = {{"CUT", "RES", "ENV", "*BRST"}, {"TYPE", "DENS", "SLIDE", "ACC"}, {"DECAY", "ACCNT", "WAVE", "DRIVE"}, {"SEND", "FBACK", "SUB", "DUCK"}};
@@ -2072,7 +2082,7 @@ static int knob_page(knob_t *k)
         k[i].hot = 0; k[i].mo = 0; k[i].txt = 0;
         if (ht >= 0) { k[i].label = TL[ht][i]; k[i].v16 = *p; k[i].disp = *p * 99 >> 16; k[i].hot = 1; continue; }
         k[i].mo = p && ht < 0 && mp_of(p) >= 0 && mo_lane_of(&U.g, mp_of(p)) >= 0;
-        if (U.page == PG_VOICE && i == 2) { k[i].label = CHR_NAME[clampi(P.eng, 0, NENG - 1)]; k[i].v16 = *p; k[i].disp = *p * 99 >> 16; continue; }
+        if (U.page == PG_VOICE && i == 2) { int32_t v = knob_eff(p); k[i].label = CHR_NAME[clampi(P.eng, 0, NENG - 1)]; k[i].v16 = v; k[i].disp = v * 99 >> 16; continue; }
         if (U.page == PG_SYS) {
             static const char *const SL[4] = {"SYNC", "CH", "USB", "LIGHT"}, *const SY[3] = {"INT", "AUTO", "EXT"};
             static const char *const UA[2] = {"STEREO", "STEMS"}, *const LT[4] = {"OFF", "LOW", "MID", "HIGH"};
@@ -2090,7 +2100,8 @@ static int knob_page(knob_t *k)
         if (U.page == PG_SEQ) { k[i].label = LB2[i]; k[i].v16 = kind == 2 ? *p * ONE16 / 127 : kind == 3 ? *p * 257 : i == 3 ? *p * 2 : *p; k[i].disp = kind ? *p : (i == 3 ? *p * 100 >> 16 : *p * 99 >> 16); continue; }
         k[i].label = LB[U.page == PG_VOICE ? 2 : U.page == PG_FX ? 3 : 0][i];
         if (U.page == PG_FX && U.fxl) { static const char *const L2[4] = {"PHASR", "RATE", "SQUASH", "HARM"}; k[i].label = L2[i]; }
-        k[i].v16 = *p; k[i].disp = *p * 99 >> 16; k[i].hot = U.page == PG_PLAY && i == 3;
+        { int32_t v = knob_eff(p); k[i].v16 = v; k[i].disp = v * 99 >> 16; }
+        k[i].hot = U.page == PG_PLAY && i == 3;
     }
     return 4;
 }
@@ -2222,7 +2233,7 @@ static void crash_send(void)
     w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_lost << 8 | (uint32_t)fm1_mc_on << 16;
     memcpy(&w[o], &fm1_mc_bar, 8u); o += 2u;
     memcpy(&w[o], &bootguard, 12u); o += 3u;
-    w[o++] = 0x00000304u;                                   /* this build: 0.3.4 */
+    w[o++] = 0x00000305u;                                   /* this build: 0.3.5 */
     w[o++] = crumbs_crash.magic == CRUMB_MAGIC ? crumbs_crash.n : 0xFFFFFFFFu;
     memcpy(&w[o], crumbs_crash.e, 128u); o += 32u;
     w[o++] = crumbs.n;
@@ -2512,7 +2523,11 @@ static void app_main(void)
             } else if (U.page == PG_SEQ) { draw_seq_page(); if (s_abs != last_strip) { last_strip = s_abs; draw_strip(); } }
             else { draw_info_page(); if (s_abs != last_strip) { last_strip = s_abs; draw_strip(); } }
             if (held_throw() >= 0 || U.page != PG_PLAY) draw_macros();
-            else { static int32_t lc, lr, le, lb; if (lc != P.cut || lr != P.res || le != P.env || lb != P.burst) { lc = P.cut; lr = P.res; le = P.env; lb = P.burst; draw_macros(); } }
+            else {   /* (the values playing: a motion changes them step by step) */
+                static int32_t lc, lr, le, lb;
+                int32_t c = knob_eff(&P.cut), r = knob_eff(&P.res), e = knob_eff(&P.env), bu = knob_eff(&P.burst);
+                if (lc != c || lr != r || le != e || lb != bu) { lc = c; lr = r; le = e; lb = bu; draw_macros(); }
+            }
             if (U.beat_flash) U.beat_flash--;
             if (U.acc_flash) U.acc_flash--;
         }
