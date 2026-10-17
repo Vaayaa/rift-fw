@@ -1709,6 +1709,7 @@ typedef struct {
 static save_t SV __attribute__((section(".lowbuf")));
 static void settings_store(void)
 {
+    crumb('W', 0, 0);
     SV.phaser = (uint16_t)clampi(P.phaser, 0, 65535); SV.ph_rate = (uint16_t)clampi(P.ph_rate, 0, 65535); SV.squash = (uint16_t)clampi(P.squash, 0, 65535);
     SV.chan = (uint16_t)((U.chan & 15) | (U.sync & 3) << 4 | (U.stems & 1) << 6);
     SV.ver = 5; SV.eng = (uint8_t)P.eng; SV.ratio = (uint8_t)P.ratio; SV.rel = (uint8_t)P.rel; SV.light = (uint8_t)(U.light + 1);
@@ -1944,10 +1945,16 @@ static void draw_info_page(void)
         cv_text(4, 0, &FONT_S, "CLOCK", C_MUTE);
         if (s_ext) { num_str(b, (s_bpm_ext + 5) / 10); cv_text(70, 0, &FONT_S, "FOLLOWING", C_ACID); cv_text(190, 0, &FONT_S, b, C_ACID); }
         else cv_text(70, 0, &FONT_S, U.sync == 2 ? "WAITING" : "OWN TEMPO", U.sync == 2 ? C_HEAT : C_INK);
-        cv_text(4, 20, &FONT_S, "IN: USB + TRS JACK", C_MUTE);
         cv_text(4, 40, &FONT_S, "NOTES CC: CH", C_MUTE); num_str(b, U.chan + 1); cv_text(120, 40, &FONT_S, b, C_INK);
         cv_text(4, 60, &FONT_S, "SEQ+SAVE  SEND DNA", C_MUTE);
         cv_text(4, 80, &FONT_S, U.stems ? "USB AUDIO 8 CH STEMS" : "USB AUDIO STEREO", C_MUTE);
+#ifndef DINGHY_HOST
+        if (fm1_crash.magic == FM1_CRASH_MAGIC) {      /* the last crash since power-on: PC, and when after its boot */
+            hex8(b, fm1_crash.pc); cv_text(4, 20, &FONT_S, "CRASH", C_HEAT); cv_text(60, 20, &FONT_S, b, C_HEAT);
+            num_str(b, (int32_t)(fm1_crash.uptime_ms / 1000u)); cv_text(150, 20, &FONT_S, b, C_HEAT); cv_text(190, 20, &FONT_S, "S", C_HEAT);
+        } else
+#endif
+        cv_text(4, 20, &FONT_S, "IN: USB + TRS JACK", C_MUTE);
         cv_text(4, 104, &FONT_S, mc_status(), C_DIMC);
     } else {
         int t;
@@ -2146,8 +2153,41 @@ static void dna_send(void)
     f[n++] = (uint8_t)(sum & 0x7Fu); f[n++] = 0xF7;
     say(ota_wire_send(f, n) == 0 ? "DNA OUT" : "DNA NOT SENT");
 }
+/* the last crash (hal/fm1_irq.h: kept in .noinit until power-off) for the host: F0 7D 'R' 'C' 2, then 32-bit words, 8 hex
+ * digits (0..15) each, F7. Words: fm1_crash (42), core 1's fault (count cpu dbg pc), mc_why | lost << 8 | on << 16, the
+ * dual-core bar (2), the boot guard (3), the build, the breadcrumbs before the crash (n, then 16 x ms code) and this
+ * run's (the same) */
+#ifdef DINGHY_HOST
+static void crash_send(void) {}
+static volatile uint8_t crash_q;
+#else
+static void crash_send(void)
+{
+#define CW (sizeof(fm1_crash_t) / 4u + 11u + 2u * 17u)
+    static uint8_t f[6u + CW * 8u + 1u];
+    static uint32_t w[CW];
+    uint32_t n = 0, i, k, o = sizeof(fm1_crash_t) / 4u;
+    memcpy(w, &fm1_crash, sizeof(fm1_crash_t));
+    w[o++] = fm1_core1_fault.count; w[o++] = fm1_core1_fault.cpu; w[o++] = fm1_core1_fault.dbg; w[o++] = fm1_core1_fault.pc;
+    w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_lost << 8 | (uint32_t)fm1_mc_on << 16;
+    memcpy(&w[o], &fm1_mc_bar, 8u); o += 2u;
+    memcpy(&w[o], &bootguard, 12u); o += 3u;
+    w[o++] = 0x00000302u;                                   /* this build: 0.3.2 */
+    w[o++] = crumbs_crash.magic == CRUMB_MAGIC ? crumbs_crash.n : 0xFFFFFFFFu;
+    memcpy(&w[o], crumbs_crash.e, 128u); o += 32u;
+    w[o++] = crumbs.n;
+    memcpy(&w[o], crumbs.e, 128u); o += 32u;
+    f[n++] = 0xF0; f[n++] = 0x7D; f[n++] = 'R'; f[n++] = 'C'; f[n++] = 2;
+    for (i = 0; i < o; i++)
+        for (k = 0; k < 8u; k++) f[n++] = (uint8_t)((w[i] >> (28u - 4u * k)) & 15u);
+    f[n++] = 0xF7;
+    say(ota_wire_send(f, n) == 0 ? "CRASH LOG OUT" : "LOG NOT SENT");
+}
+#endif
 static void dna_poll(void)
 {
+    if (crash_q) { crash_q = 0; crash_send(); }
+    {
     static genome_t t;
     uint8_t *g = (uint8_t *)&t;
     uint32_t n = dna_rx_len, p = 6, i = 0, k, sum = 0;
@@ -2163,11 +2203,13 @@ static void dna_poll(void)
     }
     RING_PUBLISH();
     dna_rx_len = 0;
+    }
 }
 static void button_down(int id)
 {
     uint32_t held = fm1_in.buttons;
     int seq = (held >> BTN_SEQ & 1u) && id != BTN_SEQ, i, ht = held_throw();
+    crumb('B', (uint32_t)id, (uint32_t)U.page << 8 | (uint32_t)P.eng);
     if (seq) {
         U.seq_used = 1;
         switch (id) {
@@ -2357,6 +2399,7 @@ static void app_main(void)
             if (!d) continue;
             if (fm1_ms - U.enc_t[k] < 40u) d *= 3;
             U.enc_t[k] = fm1_ms;
+            crumb('E', k, (uint32_t)U.page << 8 | (uint32_t)P.eng);
             switch (k) {
             case ENC_SELECT:
                 if (U.page == PG_SEQ) { U.g.scale = (uint8_t)((U.g.scale + (d > 0 ? 1 : 9)) % 10); P.scale = U.g.scale; generate(&U.g); save_slot(); publish(0); }

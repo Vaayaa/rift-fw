@@ -78,11 +78,30 @@ static void clk_push(uint32_t st, uint32_t src)
     }
 }
 static uint32_t clk_now(void) { return fm1_ticks(); }
+/* breadcrumbs (RIFT 0.3.2): the last 16 things the player and the USB host did, ms + a code ('B' button, 'E' encoder,
+ * 'U' a USB setup request, 'R' bus reset, 'S' stems switch, 'W' settings saved); frozen into crumbs_crash by a crash */
+#define CRUMB_MAGIC 0x43524D42u
+typedef struct { uint32_t magic, n, e[32]; } crumbs_t;
+static crumbs_t crumbs __attribute__((section(".noinit")));
+crumbs_t crumbs_crash __attribute__((section(".noinit")));   /* (not static: no assumed zero start) */
+static void crumb(uint32_t cat, uint32_t a, uint32_t b)
+{
+    uint32_t code = cat << 24 | (a & 0xFFu) << 16 | (b & 0xFFFFu), n = crumbs.n;
+    if (cat == 'E' && n && crumbs.e[((n - 1u) & 15u) * 2u + 1u] == code) {   /* a knob turned on: one entry, its last time */
+        crumbs.e[((n - 1u) & 15u) * 2u] = fm1_ms;
+        return;
+    }
+    crumbs.e[(n & 15u) * 2u] = fm1_ms;
+    crumbs.e[(n & 15u) * 2u + 1u] = code;
+    crumbs.n = n + 1u;
+}
 /* RIFT's own SysEx (F0 7D 'R' 'I' 'F' 'T' ...: a pattern's DNA from another unit), for the main loop */
 static uint8_t dna_rx[1024] __attribute__((section(".lowbuf")));
 static volatile uint32_t dna_rx_len;           /* set by the TIMER5 ISR, cleared by the main loop */
+static volatile uint8_t crash_q;               /* F0 7D 'R' 'C' 'R' 'S' 'H' F7: send the crash record (the main loop) */
 static void dna_rx_frame(const uint8_t *f, uint32_t n)   /* f: without F0 / F7 */
 {
+    if (n == 5u && f[0] == 0x7D && f[1] == 'R' && f[2] == 'C' && f[3] == 'R' && f[4] == 'S') { crash_q = 1; return; }
     if (dna_rx_len || n < 5u || n > sizeof dna_rx || f[0] != 0x7D || f[1] != 'R' || f[2] != 'I' || f[3] != 'F' || f[4] != 'T') return;
     memcpy(dna_rx, f, n);
     RING_PUBLISH();
@@ -352,21 +371,32 @@ static void platform_poll(void)
     }
 }
 
+static void hex8(char *b, uint32_t v)
+{
+    uint32_t k;
+    for (k = 0; k < 8u; k++) b[k] = "0123456789ABCDEF"[(v >> (28u - 4u * k)) & 15u];
+    b[8] = 0;
+}
 static void fm1_fault(const fm1_crash_t *c)
 {
+    /* the whole record (a photo of it is enough): it also survives the reboot below until power-off, and the SYS page /
+     * SysEx F0 7D 'R' 'C' 'R' 'S' 'H' F7 give it again */
+    static const char *const L[12] = {"VEC", "PC", "RETS", "SP", "EMU", "DBG", "PSR", "MS", "T0", "T1", "T2", "T3"};
     char b[12];
-    uint32_t i, t0, v[3] = {c->vec, c->pc, c->rets};
+    uint32_t i, t0, v[12] = {c->vec, c->pc, c->rets, c->sp, c->emu, c->dbg, c->psr, c->uptime_ms,
+                             c->etm[0], c->etm[1], c->etm[2], c->etm[3]};
     if (fm1_mc_on)
         fm1_mc_bar_set();                       /* a crash beside the second core: one core until power-off */
     fm1_mc_hold();
+    crumbs_crash = crumbs;                      /* what led here, for the next boot to send */
     fm1_audio_stop();
     lcd_fill(0, 0, 240, 240, RGB(160, 0, 0));
-    draw_text_box(0, 20, 240, &FONT_S, APP_NAME " CRASH", C_WHITE, 1);
-    for (i = 0; i < 3u; i++) {
-        uint32_t k;
-        for (k = 0; k < 8u; k++) b[k] = "0123456789ABCDEF"[(v[i] >> (28u - 4u * k)) & 15u];
-        b[8] = 0;
-        draw_text_box(10, 60 + i * 20, 220, &FONT_S, b, C_WHITE, 0);
+    draw_text_box(0, 8, 240, &FONT_S, APP_NAME " " APP_VER " CRASH", C_WHITE, 1);
+    for (i = 0; i < 12u; i++) {
+        uint32_t x = 4u + (i / 6u) * 120u, y = 40u + (i % 6u) * 30u;
+        draw_text_box((int)x, (int)y, 44, &FONT_S, L[i], C_WHITE, 0);
+        hex8(b, v[i]);
+        draw_text_box((int)x + 40, (int)y, 80, &FONT_S, b, C_WHITE, 0);
     }
     t0 = fm1_ticks();
     while ((uint32_t)(fm1_ticks() - t0) < 8000u * 1000u * FM1_TICKS_PER_US)
@@ -399,6 +429,9 @@ void fm1_cstart(void)
     for (s = _c1t_load, d = _c1t_start; d < _c1t_end; s++, d++) *d = *s;   /* the second core's waiting loop */
     for (s = _hot_load, d = _hot_start; d < _hot_end; s++, d++) *d = *s;   /* the audio render (build.py HOT_FNS) */
     fm1_mailbox_clear();
+    crumbs.magic = CRUMB_MAGIC;                 /* a new run: its own breadcrumbs */
+    crumbs.n = 0;
+    for (s = crumbs.e; s < crumbs.e + 32; s++) *s = 0;
     fm1_guard_enable(FM1_GUARD_STACK | FM1_GUARD_WRITE | FM1_GUARD_BUS | FM1_GUARD_PC);
     fm1_boot.p3_rst = (uint8_t)p3;
     if (boot_mode == BOOT_RECOVERY || recovery_key())

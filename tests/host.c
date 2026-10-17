@@ -50,6 +50,7 @@ static int fm1_mc_run(void (*fn)(uint32_t), uint32_t a)
     return 1;
 }
 static int fm1_mc_wait(void) { if (host_mc_fn) { host_mc_fn(host_mc_arg); host_mc_fn = 0; } return 0; }
+static void crumb(uint32_t c, uint32_t a, uint32_t b) { (void)c; (void)a; (void)b; }
 static const char *mc_status(void) { return host_mc > 0 ? "2 CORES" : "1 CORE"; }
 static volatile uint8_t usb_stems;
 static int16_t stem_q[HALF_FRAMES * 6u];

@@ -570,6 +570,9 @@ static void ep0_service(void)
         s[i] = ep0buf[i];
     usb.setups++;
     wvalue = (uint16_t)(s[2] | s[3] << 8);
+#ifdef USB_APP_HOOKS
+    crumb('U', s[1], wvalue);
+#endif
     wlength = (uint16_t)(s[6] | s[7] << 8);
     switch ((uint32_t)s[0] << 8 | s[1]) {
     case 0x0005:                                        /* SET_ADDRESS */
@@ -1295,6 +1298,9 @@ static void usb_poll(void)                              /* TIMER5 ISR, 2 kHz */
         usb.suspended = 0;
     if (iu & 0x04u) {                                   /* bus reset */
         usb.resets++;
+#ifdef USB_APP_HOOKS
+        crumb('R', 0, usb.resets);
+#endif
         sie_wr(S_FADDR, 0);
         usb.config = 0;
         usb.suspended = 0;
@@ -1388,6 +1394,9 @@ static void usb_stems_set(uint32_t on)
     on = on != 0;
     if (on == usb_stems)
         return;
+#ifdef USB_APP_HOOKS
+    crumb('S', on, 0);
+#endif
     if (usb.up) {
         usb.up = 0;
         RING_PUBLISH();

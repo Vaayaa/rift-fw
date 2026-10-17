@@ -25,6 +25,9 @@
 #define FM1_EMU_MSG (*(volatile uint32_t *)0x1EEF0D4u)
 #define FM1_ETM_CON (*(volatile uint32_t *)0x1EEF1C0u)
 #define FM1_ETM_PC(i) (*(volatile uint32_t *)(0x1EEF1C4u + 4u * (i)))
+#define FM1_C1_EMU_MSG (*(volatile uint32_t *)0x1EEF2D4u)   /* q32DSP(1): + 0x200 */
+#define FM1_C1_PCRS (*(volatile uint32_t *)0x1EEF27Cu)
+#define FM1_C1_ETM_PC(i) (*(volatile uint32_t *)(0x1EEF3C4u + 4u * (i)))
 #define FM1_DBG_WR_EN (*(volatile uint32_t *)0x1EEE240u)
 #define FM1_DBG_MSG (*(volatile uint32_t *)0x1EEE244u)
 #define FM1_DBG_MSG_CLR (*(volatile uint32_t *)0x1EEE248u)
@@ -51,6 +54,8 @@ typedef struct {
     uint32_t magic, count, vec, pc, rets, emu, dbg, sp, psr, icfg, uptime_ms;
     uint32_t etm[4];
     uint32_t early;                          /* consecutive crashes < 3 s after boot */
+    uint32_t r[16], rete, retx, usp, ssp;   /* the frame (RIFT 0.3.2: a crash read over SysEx) */
+    uint32_t c1_emu, c1_pcrs, c1_etm[4];     /* core 1 at that moment: its errors, where it ran, its branches */
 } fm1_crash_t;
 /* Not static: .noinit holds whatever the last run (or power-on) left, and a
  * file-local object would let the compiler assume its zero initial value and
@@ -154,6 +159,16 @@ void fm1_fault_c(uint32_t *f)
     for (i = 0; i < 4u; i++)
         fm1_crash.etm[i] = FM1_ETM_PC(i);
     fm1_crash.early = fm1_crash.uptime_ms < 3000u ? early + 1u : 0u;
+    for (i = 0; i < 16u; i++)
+        fm1_crash.r[i] = f[i];
+    fm1_crash.rete = f[17];
+    fm1_crash.retx = f[18];
+    fm1_crash.usp = f[22];
+    fm1_crash.ssp = f[23];
+    fm1_crash.c1_emu = FM1_C1_EMU_MSG;
+    fm1_crash.c1_pcrs = FM1_C1_PCRS;
+    for (i = 0; i < 4u; i++)
+        fm1_crash.c1_etm[i] = FM1_C1_ETM_PC(i);
     fm1_fault(&fm1_crash);
     for (;;)
         ;
