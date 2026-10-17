@@ -23,6 +23,7 @@ enum { BTN_OCT_DOWN = 0, BTN_OCT_UP = 1, BTN_FX = 2, BTN_SEL = 3, BTN_ENV = 4, B
 enum { ENC_SELECT = 0, ENC_ALGORITHM = 1, ENC_KNOB1 = 2, ENC_KNOB2 = 3, ENC_KNOB3 = 4, ENC_KNOB4 = 5, ENC_PRESETS = 6 };
 #define KEY_LED(k) (14u + (k))
 
+#include "prof.h"
 #ifdef DINGHY_HOST
 #include "../../tests/host.c"                  /* on a computer: a fake FM-1 (tests/host.c) */
 #else
@@ -98,10 +99,12 @@ static void crumb(uint32_t cat, uint32_t a, uint32_t b)
 /* RIFT's own SysEx (F0 7D 'R' 'I' 'F' 'T' ...: a pattern's DNA from another unit), for the main loop */
 static uint8_t dna_rx[1024] __attribute__((section(".lowbuf")));
 static volatile uint32_t dna_rx_len;           /* set by the TIMER5 ISR, cleared by the main loop */
-static volatile uint8_t crash_q;               /* F0 7D 'R' 'C' 'R' 'S' 'H' F7: send the crash record (the main loop) */
+static volatile uint8_t crash_q;               /* F0 7D 'R' 'C' 'R' 'S' F7: send the crash record (the main loop) */
+static volatile uint8_t prof_q;                /* F0 7D 'R' 'P' 'R' 'O' F7: send the profile so far, start a new one (0.5) */
 static void dna_rx_frame(const uint8_t *f, uint32_t n)   /* f: without F0 / F7 */
 {
     if (n == 5u && f[0] == 0x7D && f[1] == 'R' && f[2] == 'C' && f[3] == 'R' && f[4] == 'S') { crash_q = 1; return; }
+    if (n == 5u && f[0] == 0x7D && f[1] == 'R' && f[2] == 'P' && f[3] == 'R' && f[4] == 'O') { prof_q = 1; return; }
     if (dna_rx_len || n < 5u || n > sizeof dna_rx || f[0] != 0x7D || f[1] != 'R' || f[2] != 'I' || f[3] != 'F' || f[4] != 'T') return;
     memcpy(dna_rx, f, n);
     RING_PUBLISH();

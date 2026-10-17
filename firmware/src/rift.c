@@ -10,6 +10,7 @@
 #define APP_NAME "RIFT"
 #include "platform.c"
 #include "rift_tables.h"
+
 #ifndef RING_PUBLISH
 #define RING_PUBLISH() ((void)0)              /* host: no ISR to order against */
 #endif
@@ -607,6 +608,7 @@ static struct {                                 /* stage 2's state (core 1's whi
     int32_t corr16, rmsOut, crush_acc, crush_hold, crush_lp, void_mute;
     uint32_t dw, wowph, noise, kPh, kInc, tw, tr16, us;
     int32_t dlpL, dlpR; op1_t dly[4], hHP;
+    uint32_t dq;                                    /* (0.5) samples the delay has written only zeros, nothing sent */
     int32_t kEnv, kP, click, hEnv, kF8;
     int32_t dcx, dcy, dcxr, dcyr, tape_lp, tape_xf, rms, tacc; uint8_t tm_prev;
     svf_t hHP1; op1_t hLP, rLP; int32_t rfb, kout; uint32_t rp[4];   /* harmonics; the rumble loop */
@@ -1064,6 +1066,7 @@ HOT_FN void c1_job(uint32_t b)
         hi = m16(hi, S2.corr16);
         S2.rmsOut += (m24(hi, hi) - S2.rmsOut) >> 13;
         hi = m16(hi, B->rg[i]);
+        PROF(PF_S2DEC);
         /* the low band: second LP stage, the sub */
         low = m16(m16(svf_lp(&S2.xl2, B->l1[i]), G->low16) + B->sub[i], G->msub16);
         if (G->rmb > 0) {   /* RUMBLE: the low band, a little of the high and the kick through four diffusers, fed back */
@@ -1083,6 +1086,7 @@ HOT_FN void c1_job(uint32_t b)
             int32_t hg = op_lp(&S2.hLP, svf_hp(&S2.hHP1, tanh24(low * 6)));
             low += m16(hg, m16(G->harm, ONE16 * 45 / 100));
         }
+        PROF(PF_S2LOW);
         /* crush: BURST above .85 or SHRED */
         if (G->crdiv > 1 || G->crbits < 16) {
             int32_t sh2 = 24 - (G->crbits - 1);
@@ -1102,6 +1106,7 @@ HOT_FN void c1_job(uint32_t b)
             }
             if (G->ott16 > 0 || S2.ott_g != ONE16) hi = m16(hi, S2.ott_g0 + ((S2.ott_g - S2.ott_g0) * (int32_t)(i & 15u) >> 4));
         }
+        PROF(PF_S2OTT);
         {   /* FREEZE: the high band recorded at half rate, all the time; a loop of it played over the live one */
             int32_t fz = 0;
             if (G->frz_ev == 1 && (i & 15u) == 0) {
@@ -1112,7 +1117,9 @@ HOT_FN void c1_job(uint32_t b)
             if (i & 1u) { frz[S2.fw] = (int16_t)clampi((S2.facc + (hi >> 1)) >> 9, -32767, 32767); S2.fw = S2.fw + 1u == FRZ_N ? 0u : S2.fw + 1u; }
             else S2.facc = hi >> 1;
             if (S2.fon) {
-                uint32_t a = (S2.fstart + (S2.fpos >> 1)) % FRZ_N, b2 = (a + 1u) % FRZ_N;
+                uint32_t a = S2.fstart + (S2.fpos >> 1), b2;
+                if (a >= FRZ_N) a -= FRZ_N;                  /* (0.5: no division a sample; fstart, fpos / 2 < FRZ_N) */
+                b2 = a + 1u == FRZ_N ? 0u : a + 1u;
                 int32_t v = (int32_t)frz[a] * 512;
                 if (S2.fpos & 1u) v = (v + (int32_t)frz[b2] * 512) >> 1;
                 fz = m16(m24(v, S2.fgain), G->frz_mix);
@@ -1125,6 +1132,7 @@ HOT_FN void c1_job(uint32_t b)
         S2.void_mute += (G->void_tgt - S2.void_mute) / 600;
         hi = m16(hi, S2.void_mute); low = m16(low, S2.void_mute);
         hL = hR = hi;
+        PROF(PF_S2FRZ);
         if (G->ph16 > 0) {   /* phaser: 6 all-passes a side, a little feedback */
             int c, k;
             for (c = 0; c < 2; c++) {
@@ -1135,24 +1143,40 @@ HOT_FN void c1_job(uint32_t b)
                 if (c) hR = yy; else hL = yy;
             }
         }
-        {   /* tape delay: ping-pong, high band only */
+        PROF(PF_S2PH);
+        if (G->send16 <= 0 && S2.dq > DLY_N + 2u) {   /* (0.5) nothing sent and the line all zeros: it would read 0 */
+            yl = yr = 0;
+            S2.wowph += 58434u;
+            S2.dw = S2.dw + 1u == DLY_N ? 0u : S2.dw + 1u;
+            if (G->vlp >= 0) {
+                int32_t gg = G_BR_T[clampi(G->vlp, 0, 704)];
+                S2.dlpL += m30(yl - S2.dlpL, gg); S2.dlpR += m30(yr - S2.dlpR, gg); yl = S2.dlpL; yr = S2.dlpR;
+            }
+        } else {   /* tape delay: ping-pong, high band only */
             int32_t dtm = G->dt8, dt8 = dtm + m24(m16(sin24(S2.wowph), ONE16 * 15 / 10000), dtm), di = dt8 >> 8, df = (dt8 & 255) << 8;
-            uint32_t r0 = (S2.dw + DLY_N - (uint32_t)di) % DLY_N, r1 = (r0 + DLY_N - 1u) % DLY_N;
+            int32_t ri0 = (int32_t)S2.dw - di;
+            uint32_t r0, r1;
             int32_t send = m16((hL + hR) >> 1, G->send16), fl, fr;
+            int16_t wl, wr;
+            while (ri0 < 0) ri0 += (int32_t)DLY_N;          /* (0.5: no division a sample) */
+            r0 = (uint32_t)ri0; r1 = r0 ? r0 - 1u : DLY_N - 1u;
             yl = ((int32_t)dlyL[r0] * 512) + m16(((int32_t)dlyL[r1] - dlyL[r0]) * 512, df);
             yr = ((int32_t)dlyR[r0] * 512) + m16(((int32_t)dlyR[r1] - dlyR[r0]) * 512, df);
             S2.wowph += 58434u;                              /* ~0.6 Hz */
             fl = m16(op_lp(&S2.dly[1], op_hp(&S2.dly[0], yr)), G->fb);
             fr = m16(op_lp(&S2.dly[3], op_hp(&S2.dly[2], yl)), G->fb);
             fl = m16(tanh24(m16(fl, 78643)), 54613); fr = m16(tanh24(m16(fr, 78643)), 54613);
-            dlyL[S2.dw] = (int16_t)clampi((send + fl) >> 9, -32767, 32767);
-            dlyR[S2.dw] = (int16_t)clampi(fr >> 9, -32767, 32767);
+            wl = (int16_t)clampi((send + fl) >> 9, -32767, 32767);
+            wr = (int16_t)clampi(fr >> 9, -32767, 32767);
+            dlyL[S2.dw] = wl; dlyR[S2.dw] = wr;
+            S2.dq = (wl | wr) || G->send16 > 0 ? 0u : S2.dq + 1u;
             S2.dw = S2.dw + 1u == DLY_N ? 0u : S2.dw + 1u;
             if (G->vlp >= 0) {
                 int32_t gg = G_BR_T[clampi(G->vlp, 0, 704)];
                 S2.dlpL += m30(yl - S2.dlpL, gg); S2.dlpR += m30(yr - S2.dlpR, gg); yl = S2.dlpL; yr = S2.dlpR;
             }
         }
+        PROF(PF_S2DLY);
         /* duck + sum */
         L = m16(low + hL + yl, B->bg[i]); R = m16(low + hR + yr, B->bg[i]);
         /* scope: the bass, every 2nd sample */
@@ -1163,11 +1187,14 @@ HOT_FN void c1_job(uint32_t b)
         S2.kPh += S2.kInc + (uint32_t)m24((int32_t)(S2.kInc >> 1), m24(S2.kP, S2.kP)) * 4u;
         S2.kEnv = m30(S2.kEnv, K_KICK_T[48]); S2.click = m30(S2.click, K_CLICK);
         S2.noise = S2.noise * 1103515245u + 12345u;
-        kick = m24(sin24(S2.kPh), m16(S2.kEnv, 72090)) + m16(m24((int32_t)S2.noise >> 7, S2.click), ONE16 / 4);
-        kick = tanh24(m16(kick, 91750));
-        S2.kout = kick;
         S2.hEnv = m30(S2.hEnv, K_HAT);
-        hat = m16(m24(op_hp(&S2.hHP, (int32_t)S2.noise >> 7), S2.hEnv), ONE16 * 35 / 100);
+        if ((B->drums && B->playing) || G->rmb > 0) {   /* (0.5) the kick: heard, or fed to RUMBLE; else not made */
+            kick = m24(sin24(S2.kPh), m16(S2.kEnv, 72090)) + m16(m24((int32_t)S2.noise >> 7, S2.click), ONE16 / 4);
+            kick = tanh24(m16(kick, 91750));
+        } else kick = 0;
+        S2.kout = kick;
+        hat = op_hp(&S2.hHP, (int32_t)S2.noise >> 7);   /* (its filter runs always: the sound is the same either way) */
+        hat = B->drums && B->playing ? m16(m24(hat, S2.hEnv), ONE16 * 35 / 100) : 0;
         {
             int32_t dl = 0, dr = 0;
             if (B->drums && B->playing) { dl = m16(kick + m16(hat, ONE16 * 8 / 10), B->drum_lvl); dr = m16(kick + m16(hat, ONE16 * 11 / 10), B->drum_lvl); }
@@ -1180,6 +1207,7 @@ HOT_FN void c1_job(uint32_t b)
             }
             L += dl; R += dr;
         }
+        PROF(PF_S2DRM);
         /* DC block */
         { int32_t a = L - S2.dcx + m30(S2.dcy, 1072235000), c = R - S2.dcxr + m30(S2.dcyr, 1072235000); S2.dcx = L; S2.dcy = a; S2.dcxr = R; S2.dcyr = c; L = a; R = c; }
         /* tape stop (mono varispeed) */
@@ -1208,6 +1236,7 @@ HOT_FN void c1_job(uint32_t b)
         S2.rms += (m24(L, L) - S2.rms) >> 11;
         out[2u * i] += L >> 9;
         out[2u * i + 1u] += R >> 9;
+        PROF(PF_S2OUT);
     }
     if (fm1_mc_on) mt_check(mt_core());             /* the memory self-test: this core, the other working (two cores only) */
 #ifndef DINGHY_HOST
@@ -1324,6 +1353,8 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
         }
     }
     if (!dsp_ready) return;
+    prof_on = (uint8_t)(prof_req && !fm1_mc_on);
+    if (prof_on) prof_t = prof_t0 = PROF_NOW();
     {   /* the load governor (0.4): the last block took over 83 % of its time -> one optional effect more rests (at once);
          * 2 s under 65 % -> one comes back. No crackle on one core, the effects whenever they fit */
         uint32_t ld = (uint32_t)s_cpu;
@@ -1349,6 +1380,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
         B->ntrig = 0; B->playing = D.playing; B->drums = (uint8_t)(P.drums != 0); B->drum_lvl = P.drum_lvl;
         B->kick_tune = (uint8_t)(P.kick_tune != 0); B->root = (uint8_t)P.root;
     }
+    PROF(PF_PRE);
     for (i = 0; i < NB; i++) {
         int32_t sl16 = D.step_len16, k;
         uint32_t o;
@@ -1406,6 +1438,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
         k = D.roll_gate_on > 0 ? ONE16 : 0;
         D.roll_gate_env += (k - D.roll_gate_env) / (k ? 2 : 50);
 
+        PROF(PF_SEQ);
         if (++D.ctr >= 16u) { D.ctr = 0; control(); }
         if ((i & 15u) == 15u) {                     /* this segment's control values for stage 2 */
             seg_t *G = &B->sg[i >> 4];
@@ -1452,6 +1485,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
         if (D.eng == E_GROWL) D.idx = m30(D.idx, D.kIdx);
         else if (D.eng == E_REESE) { D.noise = D.noise * 1103515245u + 12345u; D.drift += (((int32_t)(D.noise >> 22) - 512) >> 4) - (D.drift >> 13); D.drift = clampi(D.drift, -ONE16 / 400, ONE16 / 400); }
 
+        PROF(PF_CTL);
         /* ---- 2x oversampled core */
         for (o = 0; o < 2u; o++) {
             int32_t x, x2 = 0, y, s, hiS, h, hg, sh, par = 0;
@@ -1505,11 +1539,13 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
                 x = op_hp(&D.preHP, tanh24(m16(x, D.preG) + D.bias) - D.tbias);
                 if (D.eng == E_SCREAM) x2 = tanh24(m16(x2, D.preG) + D.bias) - D.tbias;
             }
+            PROF(PF_OSC);
             /* the filter */
             if (D.eng == E_GROWL) { int32_t lp, bp; svf_run(&D.gsvf, x, &lp, &bp); y = m16(lp, ONE16 * 12 / 10); }
             else if (D.eng == E_SCREAM) y = m16(lad_run(&D.lad, &D.lc, x) + lad_run(&D.lad2, &D.lc2, x2), ONE16 * 62 / 100);
             else y = lad_run(&D.lad, &D.lc, x);
             y = m24(y, D.vca);
+            PROF(PF_FLT);
             /* fold */
             {
                 int32_t fa = m16(D.fold16, D.foldComp16);
@@ -1533,6 +1569,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
                 y = lerp16(y, clampi(k, -8 * ONE24, 8 * ONE24), P.formant);
             }
             if (D.eng == E_RUMBLE) { int32_t lp, bp; svf_run(&D.bp700, tanh24(y * 3), &lp, &bp); par = m16(m16(bp, BP700_K16), ONE16 / 10); }
+            PROF(PF_FOLD);
             /* split at 120 Hz (Linkwitz-Riley 4): the first stage here, the low band's second stage at the base rate
              * (its first LP stage is 90 dB down at the OS Nyquist: summing the two samples is all the decimation needs) */
             {
@@ -1544,6 +1581,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
             }
             if (D.md_hpf) hiS = svf_hp(&D.riseHP, hiS);
             if (o) D.rmsIn += (m24(hiS, hiS) - D.rmsIn) >> 13;
+            PROF(PF_SPLIT);
             /* BURST on the high band */
             if (D.wet16 > 0) {
                 h = hiS + m16(op_hp(&D.hump, hiS), D.hump16);
@@ -1555,6 +1593,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
                 h = m16(lerp16(hiS, m16(sh, 62259), D.wet16), D.comp16b);
             } else h = m16(hiS, D.comp16b);
             B->hos[2u * i + o] = h;
+            PROF(PF_BURST);
         }
         /* the low band's first stage and the sub, the roll gate, the duck gain: for stage 2 */
         B->l1[i] = D.l1sum; D.l1sum = 0;
@@ -1568,6 +1607,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
             B->bg[i] = m16(m16(dg, D.post16), ONE16 * 9 / 10);
             D.duck_extra = m30(D.duck_extra, 1073688000);
         }
+        PROF(PF_POST);
     }
     if (mc) {
         mt_check(0);                                /* the memory self-test on core 0, core 1 working beside it */
@@ -1578,6 +1618,7 @@ HOT_FN void app_audio(int32_t *out, uint32_t n)
         }
     } else
         c1_job(D.blk);                              /* one core: stage 2 of this block, now */
+    if (prof_on) { uint32_t tt = PROF_NOW() - prof_t0; prof_blocks++; if (tt > prof_max) prof_max = tt; }
     s_abs = D.abs; s_onsets = D.onsets; s_bar = D.bar; s_gstep = D.gstep; s_playing = D.playing; s_rms = S2.rms;
 #ifndef DINGHY_HOST
     s_cpu = (fm1_ticks() - t_start) / FM1_TICKS_PER_US;
@@ -1638,6 +1679,9 @@ static struct {
     __typeof__(((genome_t *)0)->mo) mot[8];   /* each slot's motion */
     int chan, sync, stems;                /* MIDI channel - 1; SYNC 0 INT 1 AUTO 2 EXT; USB audio 0 stereo 1 stems */
     int dual;                             /* SYS > SELECT: the second core from the next power-on (0.4: off by default) */
+    int lk_key, lk_lane, lk_done; uint32_t lk_t;   /* SEQ + a lane's key: a tap regenerates it, a hold (0.4 s) locks it (0.5) */
+    uint64_t led_lit, led_glow;           /* the LEDs as last set (0.5: hints) */
+    uint32_t seq_t, rec_t;                /* when SEQ / REC went down: their hints after 0.18 s (a tap shows none) */
     int fxl;                              /* the FX page's knobs: 0 SEND FBACK SUB DUCK, 1 PHASR RATE SQUASH HARM */
     int light, light_set; uint32_t cpu_pk, c1_pk, pk_t, sel_t, dice_n;
     int32_t dice_mem[16]; int has_dice;   /* the sound before the last dice */   /* key backlight 0..3; CPU peaks (us a block) */
@@ -1690,6 +1734,16 @@ static void save_slot(void)
     U.mot[U.pat] = U.g.mo;
     U.slot[U.pat].seed = U.g.seed; U.slot[U.pat].gen = U.g.gen; U.slot[U.pat].type = U.g.type; U.slot[U.pat].dens = U.g.dens;
     U.slot[U.pat].slide = U.g.slide; U.slot[U.pat].acc = U.g.acc; U.slot[U.pat].root = U.g.root; U.slot[U.pat].scale = U.g.scale;
+    {   /* the lanes' locks (0.5; the slot's spare byte): a locked lane comes back locked, as its DNA makes it */
+        int l; uint8_t m = 0;
+        for (l = 0; l < NL; l++) if (U.g.ln[l].lock) m |= (uint8_t)(1u << l);
+        U.slot[U.pat].pad[0] = m;
+    }
+}
+static void slot_locks(genome_t *g, int s)
+{
+    int l;
+    for (l = 0; l < NL; l++) g->ln[l].lock = (uint8_t)((U.slot[s].pad[0] >> l) & 1u);
 }
 static void load_slot(int i, int queue)
 {
@@ -1697,6 +1751,7 @@ static void load_slot(int i, int queue)
     genome_init(&U.g, U.slot[U.pat].seed, U.slot[U.pat].type, U.slot[U.pat].dens, U.slot[U.pat].slide, U.slot[U.pat].acc, U.slot[U.pat].scale);
     if (U.slot[U.pat].gen) { U.g.gen = U.slot[U.pat].gen; generate(&U.g); }
     U.g.root = U.slot[U.pat].root; P.root = U.g.root; P.scale = U.g.scale;
+    slot_locks(&U.g, U.pat);
     U.g.mo = U.mot[U.pat];
     publish(queue);
 }
@@ -1834,6 +1889,7 @@ static int32_t scope_trigger(void)
     for (k = 500; k > 260; k--) { int16_t a = scope[(w - k - 1u) & 511u], b = scope[(w - k) & 511u]; if (a < 0 && b >= 0) return (int32_t)(w - k); }
     return (int32_t)(w - 300u);
 }
+static int held_throw(void);
 static void draw_scope(void)
 {
     int32_t st = scope_trigger(), x, prev = 0, pk = 400, i, frac = s_frac, dy = 0, hold = 1, flip = 0;
@@ -1894,6 +1950,7 @@ static void draw_scope(void)
         num_str(b + 5, frac * 100 >> 16);
         cv_text(236 - text_w(&FONT_S, b), 102, &FONT_S, b, C_ACID);
     }
+    if (held_throw() >= 0 && s_th[T_VOID] < 2) cv_text(6, 102, &FONT_S, "OCT+ KEEP  OCT- ABORT", C_MUTE);
     if (s_th[T_VOID] >= 2) {
         cv_rect(0, 0, 240, 52, C_BLACK); cv_rect(0, 70, 240, 52, C_BLACK);
         cv_rect(186, 6, 50, 18, C_HEAT); cv_text(191, 7, &FONT_S, "VOID", C_BLACK);
@@ -2260,7 +2317,7 @@ static void crash_send(void)
     w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_lost << 8 | (uint32_t)fm1_mc_on << 16;
     memcpy(&w[o], &fm1_mc_bar, 8u); o += 2u;
     memcpy(&w[o], &bootguard, 12u); o += 3u;
-    w[o++] = 0x00000401u;                                   /* this build: 0.4.1 */
+    w[o++] = 0x00000500u;                                   /* this build: 0.5 */
     w[o++] = crumbs_crash.magic == CRUMB_MAGIC ? crumbs_crash.n : 0xFFFFFFFFu;
     memcpy(&w[o], crumbs_crash.e, 128u); o += 32u;
     w[o++] = crumbs.n;
@@ -2286,9 +2343,35 @@ static void crash_send(void)
     say(ota_wire_send(f, n) == 0 ? "CRASH LOG OUT" : "LOG NOT SENT");
 }
 #endif
+/* the profile (0.5) for the host: F0 7D 'R' 'P' 1, then words as 8 hex digits: blocks, the longest block, the parts
+ * (PF_N, TIMER4 ticks summed), the last block's us, lite_lv, the engine, mc_why | on << 8; then a new profile starts */
+#ifdef DINGHY_HOST
+static void prof_send(void) {}
+static volatile uint8_t prof_q;
+#else
+static void prof_send(void)
+{
+    static uint8_t f[6u + (PF_N + 6u) * 8u + 1u];
+    uint32_t w[PF_N + 6u], n = 0, i, k, o = 0;
+    w[o++] = prof_blocks; w[o++] = prof_max;
+    for (i = 0; i < PF_N; i++) w[o++] = prof_acc[i];
+    w[o++] = s_cpu; w[o++] = (uint32_t)lite_lv; w[o++] = (uint32_t)P.eng; w[o++] = (uint32_t)mc_why | (uint32_t)fm1_mc_on << 8;
+    f[n++] = 0xF0; f[n++] = 0x7D; f[n++] = 'R'; f[n++] = 'P'; f[n++] = 1;
+    for (i = 0; i < o; i++)
+        for (k = 0; k < 8u; k++) f[n++] = (uint8_t)((w[i] >> (28u - 4u * k)) & 15u);
+    f[n++] = 0xF7;
+    prof_req = 0;                                   /* (the audio ISR stops adding; then everything back to 0) */
+    RING_PUBLISH();
+    say(ota_wire_send(f, n) == 0 ? "PROFILE OUT" : "PROFILE NOT SENT");
+    memset(prof_acc, 0, sizeof prof_acc); prof_blocks = 0; prof_max = 0;
+    RING_PUBLISH();
+    prof_req = 1;
+}
+#endif
 static void dna_poll(void)
 {
     if (crash_q) { crash_q = 0; crash_send(); }
+    if (prof_q) { prof_q = 0; prof_send(); }
     {
     static genome_t t;
     uint8_t *g = (uint8_t *)&t;
@@ -2332,7 +2415,7 @@ static void button_down(int id)
     case BTN_OCT_UP: if (ht >= 0) cmd(OP_KEEP, (uint32_t)ht, 0); else if (U.oct < 2) U.oct++; break;
     case BTN_OCT_DOWN: if (ht >= 0) cmd(OP_ABORT, (uint32_t)ht, 0); else if (U.oct > -2) U.oct--; break;
     case BTN_HOME: U.home_t = fm1_ms; U.home_panic = 0; break;
-    case BTN_SEQ: U.seq_used = 0; break;
+    case BTN_SEQ: U.seq_used = 0; U.seq_t = fm1_ms; break;
     case BTN_EDIT: U.page = U.page == PG_VOICE ? PG_FX : U.page == PG_FX ? PG_SYS : PG_VOICE; break;
     case BTN_GLO: P.drums = !P.drums; say(P.drums ? "DRUMS ON" : "DRUMS OFF"); break;
     case BTN_SEL:   /* the throw bank on PLAY / SEQ; the key backlight on FX; the sound dice on VOICE (on release) */
@@ -2344,7 +2427,7 @@ static void button_down(int id)
         U.sel_t = fm1_ms;
         break;
     case BTN_SAVE: settings_store(); break;
-    case BTN_REC: U.rec_held = 1; U.ntap = 0; break;
+    case BTN_REC: U.rec_held = 1; U.ntap = 0; U.rec_t = fm1_ms; break;
     }
     U.dirty_all = 1;
 }
@@ -2376,7 +2459,7 @@ static void key_down(int k)
         static const int8_t WP[8] = {14, 16, 18, 19, 21, 23, 24, 26}; /* G4 .. G5 */
         int i;
         U.seq_used = 1;
-        for (i = 0; i < 8; i++) if (WL[i] == k) { push_undo(); hard_lane(&U.g, i); publish(0); say(LANE_NAME[i]); return; }
+        for (i = 0; i < 8; i++) if (WL[i] == k) { U.lk_key = k; U.lk_lane = i; U.lk_t = fm1_ms; U.lk_done = 0; return; }   /* (tap or hold: key_up / lane_hold) */
         for (i = 0; i < 8; i++) if (WP[i] == k) { save_slot(); load_slot(i, 1); say("PATTERN"); return; }
         return;
     }
@@ -2386,8 +2469,31 @@ static void key_down(int k)
     cmd(OP_ON, (uint32_t)n, acc);
     if (!s_playing) midi_send(0x90u | (uint32_t)U.chan, (uint32_t)n - 24u, acc ? 127u : 96u);
 }
+/* SEQ + a lane's key: held 0.4 s -> the lane locked (or free again): no mutation, drift or regeneration changes it */
+static void lane_hold(void)
+{
+    if (U.lk_key < 0 || U.lk_done || fm1_ms - U.lk_t < 400u) return;
+    {
+        static char m[12];
+        int l = U.lk_lane, n = 0; const char *s;
+        U.g.ln[l].lock ^= 1u; U.lk_done = 1;
+        for (s = LANE_NAME[l]; *s; s++) m[n++] = *s;
+        for (s = U.g.ln[l].lock ? " LOCKED" : " FREE"; *s; s++) m[n++] = *s;
+        m[n] = 0;
+        publish(0); save_slot(); say(m);
+    }
+}
 static void key_up(int k)
 {
+    if (k == U.lk_key) {   /* a tap on a lane's key (SEQ held when it went down): that lane anew, unless locked */
+        int l = U.lk_lane;
+        U.lk_key = -1;
+        if (!U.lk_done) {
+            if (U.g.ln[l].lock) say("LOCKED: HOLD TO FREE");
+            else { push_undo(); hard_lane(&U.g, l); publish(0); say(LANE_NAME[l]); }
+        }
+        return;
+    }
     int n = 53 + k + 12 * U.oct;
     U.key_up_t[k] = fm1_ms; U.key_t[k] = 0;
     cmd(OP_OFF, (uint32_t)n, 0);
@@ -2425,12 +2531,127 @@ static void send_cc(void)
     for (i = 0; i < 6; i++) if (U.lastcc[i] != v[i]) { U.lastcc[i] = v[i]; midi_send(0xB0u | (uint32_t)U.chan, CC[i], (uint32_t)clampi(v[i], 0, 127)); }
 }
 
+/* ---------------------------------------------------------------- hints (0.5): what a held key opens, lit */
+#define ID_KEY(k) (14 + (k))                     /* (KEY_LED: the note keys' LED ids) */
+static const int8_t LANE_KEY[8] = {0, 2, 4, 6, 7, 9, 11, 12};      /* F3 G3 A3 B3 C4 D4 E4 F4 */
+static const int8_t SLOT_KEY[8] = {14, 16, 18, 19, 21, 23, 24, 26}; /* G4 .. G5 */
+static int hint_mode(void)                       /* 1 SEQ held, 2 REC held, 0 none */
+{
+    uint32_t held = fm1_in.buttons;
+    if ((held >> BTN_SEQ & 1u) && (U.seq_used || fm1_ms - U.seq_t >= 180u)) return 1;
+    if (U.rec_held && held_throw() < 0 && fm1_ms - U.rec_t >= 180u) return 2;
+    return 0;
+}
+static void leds_update(void)
+{
+    uint64_t lit = 0, glow = 0;
+    int i, ht = held_throw(), hm = hint_mode(), blink = (int)((fm1_ms / 250u) & 1u);
+#define LIT(id) (lit |= 1ull << (id))
+#define GLOW(id) (glow |= 1ull << (id))
+    /* the throws: armed (fast blink), on, latched (slow blink) */
+    for (i = 0; i < 4; i++) {
+        int t = THROW_OF[i], s = s_th[t], j;
+        for (j = 0; j < 4; j++) { int c = combo_of(i, j); if (j != i && c >= 0 && s_th[c] > s) s = s_th[c]; }
+        if (s == 1 ? (fm1_ms / 60u) & 1u : s >= 2 ? (U.latch[t] ? (fm1_ms / 300u) & 1u : 1) : 0) LIT(THROW_BTN[i]);
+    }
+    if (s_playing && U.beat_flash) LIT(BTN_PLAY);
+    if (U.page == PG_SEQ) LIT(BTN_SEQ);
+    if (U.page == PG_PLAY) LIT(BTN_HOME);
+    if (U.page >= PG_VOICE) LIT(BTN_EDIT);
+    if (U.rec_held) LIT(BTN_REC);
+    if (P.drums) LIT(BTN_GLO);
+    if (U.oct > 0) LIT(BTN_OCT_UP);
+    if (U.oct < 0) LIT(BTN_OCT_DOWN);
+    if (U.light > 0) {                           /* the backlight's landmarks: the root notes, the throws */
+        int k;
+        for (k = 0; k < 27; k++) if ((53 + k + 12 * U.oct - P.root + 120) % 12 == 0) GLOW(ID_KEY(k));
+        for (k = 0; k < 4; k++) GLOW(THROW_BTN[k]);
+    }
+    /* what each page's SEL does */
+    if ((U.page == PG_PLAY || U.page == PG_SEQ) && U.bank) LIT(BTN_SEL);
+    else if (U.page != PG_SYS) GLOW(BTN_SEL);
+    if (hm == 1) {   /* SEQ held: its combinations lit; the lanes' keys (locked: lit), the slots' (this one: lit) */
+        static const uint8_t SB[7] = {BTN_PLAY, BTN_REC, BTN_HOME, BTN_EDIT, BTN_OCT_DOWN, BTN_FX, BTN_SAVE};
+        uint64_t keys = 0x7FFFFFFull << 14;
+        lit &= ~keys; glow = 0;                  /* (only what SEQ opens) */
+        for (i = 0; i < 7; i++) LIT(SB[i]);
+        if (!U.hasB) lit &= ~(1ull << BTN_EDIT), GLOW(BTN_EDIT);
+        for (i = 0; i < 8; i++) {
+            if (U.g.ln[i].lock) LIT(ID_KEY(LANE_KEY[i])); else GLOW(ID_KEY(LANE_KEY[i]));
+            if (i == U.pat) LIT(ID_KEY(SLOT_KEY[i])); else GLOW(ID_KEY(SLOT_KEY[i]));
+        }
+    } else if (hm == 2) {   /* REC held: HOME clears the motion; playing: the keys tap a melody */
+        LIT(BTN_HOME); glow = 0;
+        if (s_playing) { int k; for (k = 0; k < 27; k++) GLOW(ID_KEY(k)); }
+    } else if (ht >= 0) {   /* a throw held: OCT+ keeps, OCT- drops it; the keys it combines with blink */
+        LIT(BTN_OCT_UP); LIT(BTN_OCT_DOWN);
+        for (i = 0; i < 4; i++) if (U.tdown_on[i]) { int j; for (j = 0; j < 4; j++) if (j != i && combo_of(i, j) >= 0 && !U.tdown_on[j] && blink) LIT(THROW_BTN[j]); }
+    }
+#undef LIT
+#undef GLOW
+    if (lit != U.led_lit || glow != U.led_glow) {
+        uint32_t id;
+        for (id = 0; id < 41u; id++) {
+            uint64_t m = 1ull << id;
+            if ((lit ^ U.led_lit) & m) fm1_led_key(id, (lit & m) != 0);
+            if ((glow ^ U.led_glow) & m) fm1_led_glow_key(id, (glow & m) != 0);
+        }
+        U.led_lit = lit; U.led_glow = glow;
+    }
+    if (U.light_set != U.light) {               /* the backlight itself: every key and button */
+        static const uint16_t BG_NS[4] = {0, 700, 1800, 4000};
+        U.light_set = U.light;
+        fm1_led_bg_ns = BG_NS[U.light & 3];
+        fm1_led_bg_all(U.light > 0);
+    }
+}
+/* the legend while SEQ or REC is held, where the page's picture is */
+static void draw_hint(int hm)
+{
+    cv_begin(240, 124, C_BLACK);
+    if (hm == 1) {
+        static const char *const L[6][2] = {{"PLAY", "MUTATE"}, {"REC", "SOFT"}, {"HOME", "UNDO"}, {"EDIT", "A/B"}, {"OCT-", "DROP"}, {"FX", "FILL"}};
+        int i;
+        for (i = 0; i < 6; i++) {
+            int32_t x = (i & 1) * 120, y = (i >> 1) * 17;
+            cv_text(x + 4, y, &FONT_S, L[i][0], C_ACID);
+            cv_text(x + 48, y, &FONT_S, L[i][1], i == 3 && !U.hasB ? C_DIMC : C_INK);
+        }
+        cv_text(4, 51, &FONT_S, "SAVE", C_ACID); cv_text(48, 51, &FONT_S, "SEND DNA", C_INK);
+        cv_text(4, 70, &FONT_S, "F3-F4  TAP NEW  HOLD LOCK", C_MUTE);
+        for (i = 0; i < 8; i++) {
+            int32_t x = 4 + i * 29;
+            if (U.g.ln[i].lock) { cv_rect(x - 1, 87, 28, 15, C_ACID); cv_text(x, 86, &FONT_S, LANE_NAME[i], C_BLACK); }
+            else cv_text(x, 86, &FONT_S, LANE_NAME[i], C_INK);
+        }
+        cv_text(4, 105, &FONT_S, "G4-G5  SLOT", C_MUTE);
+        {
+            char b[4] = {(char)('1' + U.pat), 0, 0, 0};
+            cv_text(100, 105, &FONT_S, b, C_ACID);
+        }
+    } else {
+        int l, n = 0;
+        cv_text(4, 0, &FONT_S, s_playing ? "TURN K1-K4  RECORD MOTION" : "PLAY FIRST TO RECORD", s_playing ? C_HEAT : C_MUTE);
+        cv_text(4, 17, &FONT_S, "KEYS", C_ACID); cv_text(48, 17, &FONT_S, s_playing ? "TAP A MELODY" : "-", C_INK);
+        cv_text(4, 34, &FONT_S, "HOME", C_ACID); cv_text(48, 34, &FONT_S, "CLEAR MOTION", C_INK);
+        cv_text(4, 58, &FONT_S, "MOTION IN THIS SLOT", C_MUTE);
+        for (l = 0; l < 4; l++)
+            if (U.g.mo.id[l] && U.g.mo.id[l] <= NMP) {
+                static const char *const MN[NMP] = {"CUT", "RES", "ENV", "BRST", "DECAY", "ACCNT", "CHR", "DRIVE", "SEND", "FBACK", "SUB", "DUCK", "PHASR", "RATE", "SQUSH", "HARM"};
+                cv_text(4 + (n % 4) * 58, 76, &FONT_S, MN[U.g.mo.id[l] - 1], C_ACID); n++;
+            }
+        if (!n) cv_text(4, 76, &FONT_S, "NONE", C_DIMC);
+        if (U.ntap) { char b[16] = "TAPPED "; num_str(b + 7, U.ntap); cv_text(4, 100, &FONT_S, b, C_HEAT); }
+    }
+    cv_blit(0, 26);
+}
+
 static void app_main(void)
 {
     uint32_t prev_keys = 0, last_draw = 0, last_cc = 0, last_strip = 0xFFFFFFFFu;
     int i;
     memset(&U, 0, sizeof U);
-    U.combo = -1; for (i = 0; i < 4; i++) U.tactive[i] = -1; U.last_note = -1;
+    U.combo = -1; for (i = 0; i < 4; i++) U.tactive[i] = -1; U.last_note = -1; U.lk_key = -1;
     P.vol = ONE16 * 85 / 100; P.bpm10 = 1320; P.lock = 100; P.drums = 1; P.drum_lvl = ONE16 * 65 / 100; P.glide = ONE16 / 2;
     P.mod_depth = ONE16 * 35 / 100; P.kick_tune = 1; P.harm = ONE16 / 4; P.squash = ONE16 * 6 / 100 * 10; P.ph_rate = ONE16 * 6 / 100;
     for (i = 0; i < NTH; i++) { P.tp[i][0] = P.tp[i][1] = P.tp[i][2] = P.tp[i][3] = ONE16 / 2; }
@@ -2465,6 +2686,8 @@ static void app_main(void)
     dsp_ready = 1;
     genome_init(&U.g, U.slot[U.pat].seed, U.slot[U.pat].type, U.slot[U.pat].dens, U.slot[U.pat].slide, U.slot[U.pat].acc, U.slot[U.pat].scale);
     if (U.slot[U.pat].gen) { U.g.gen = U.slot[U.pat].gen; generate(&U.g); }
+    slot_locks(&U.g, U.pat);
+    U.g.mo = U.mot[U.pat];                      /* (0.5: the boot's slot plays its saved motion too) */
     gbuf[0] = U.g; g_a = 0; U.next_buf = 1;
     lcd_fill(0, 0, 240, 240, C_BLACK);
     cv_begin(240, 120, C_BLACK);
@@ -2531,31 +2754,15 @@ static void app_main(void)
         /* clock out */
         while (U.clk_sent != s_clk24) { U.clk_sent++; if (!s_ext) midi_send(0xF8, 0, 0); }   /* (a follower sends none: no loops) */
         if (fm1_ms - last_cc >= 8u) { last_cc = fm1_ms; send_cc(); }
-        /* LEDs */
-        for (i = 0; i < 4; i++) {
-            int t = THROW_OF[i], s = s_th[t], j;
-            for (j = 0; j < 4; j++) { int c = combo_of(i, j); if (j != i && c >= 0 && s_th[c] > s) s = s_th[c]; }
-            fm1_led_key((uint32_t)THROW_BTN[i], s == 1 ? (fm1_ms / 60u) & 1u : s >= 2 ? (U.latch[t] ? (fm1_ms / 300u) & 1u : 1) : 0);
-        }
-        fm1_led_key(BTN_PLAY, s_playing && U.beat_flash);
-        fm1_led_key(BTN_SEQ, U.page == PG_SEQ); fm1_led_key(BTN_HOME, U.page == PG_PLAY); fm1_led_key(BTN_EDIT, U.page >= PG_VOICE);
-        fm1_led_key(BTN_REC, U.rec_held); fm1_led_key(BTN_GLO, P.drums);
-        fm1_led_key(BTN_OCT_UP, U.oct > 0); fm1_led_key(BTN_OCT_DOWN, U.oct < 0);
-        if (U.light_set != U.light * 16 + U.oct + 2 + P.root * 64) {   /* the backlight: every key; the root notes and the throws glow */
-            static const uint16_t BG_NS[4] = {0, 700, 1800, 4000};
-            int k;
-            U.light_set = U.light * 16 + U.oct + 2 + P.root * 64;
-            fm1_led_bg_ns = BG_NS[U.light & 3];
-            fm1_led_bg_all(U.light > 0);
-            for (k = 0; k < 27; k++) fm1_led_glow_key(KEY_LED(k), U.light > 0 && (53 + k + 12 * U.oct - P.root + 120) % 12 == 0);
-            for (k = 0; k < 4; k++) fm1_led_glow_key((uint32_t)THROW_BTN[k], U.light > 0);
-        }
+        leds_update();
+        lane_hold();
         /* screen: ~25 fps for the live parts, the rest on change */
         if (fm1_ms - last_draw >= 40u) {
             last_draw = fm1_ms;
             if (U.dirty_all) { U.dirty_all = 0; top_bar(); draw_macros(); last_strip = 0xFFFFFFFFu; }
             dot();
-            if (U.page == PG_PLAY) {
+            if (hint_mode()) { draw_hint(hint_mode()); last_strip = 0xFFFFFFFFu; }
+            else if (U.page == PG_PLAY) {
                 draw_scope();
                 if (s_abs != last_strip) { last_strip = s_abs; draw_strip(); }
             } else if (U.page == PG_SEQ) { draw_seq_page(); if (s_abs != last_strip) { last_strip = s_abs; draw_strip(); } }

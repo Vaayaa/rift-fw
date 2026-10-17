@@ -1,0 +1,31 @@
+# a heavy scene: playing, BURST up, phaser + OTT + HARM on, throws one after another (combo BUILD, FREEZE, SHRED)
+500 btn 12
+540 btnup 12
+800 enc 5 60
+1000 btn 6
+1020 btnup 6
+1100 btn 6
+1120 btnup 6
+1200 btn 3
+1220 btnup 3
+1300 enc 2 40
+1400 enc 3 20
+1500 enc 4 40
+1600 enc 5 20
+1700 btn 8
+1720 btnup 8
+2000 btn 2
+4000 btnup 2
+4500 btn 2
+4520 btn 5
+6500 btnup 5
+6520 btnup 2
+7000 btn 4
+7020 btn 10
+9000 btnup 10
+9020 btnup 4
+9500 btn 5
+9520 btn 4
+11500 btnup 4
+11520 btnup 5
+12000 end

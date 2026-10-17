@@ -31,9 +31,10 @@ static int32_t host_enc[7];
 static uint32_t fm1_input_edges(uint32_t *released) { uint32_t b = host_edges; host_edges = 0; *released = host_rel; host_rel = 0; return b; }
 static uint32_t fm1_input_note_edges(void) { return 0; }   /* (the script sets fm1_in.notes) */
 static int32_t fm1_enc_take(uint32_t e) { int32_t d = host_enc[e]; host_enc[e] = 0; return d; }
-static void fm1_led_key(uint32_t id, int on) { (void)id; (void)on; }
+static uint8_t host_lit[41], host_glow[41];
+static void fm1_led_key(uint32_t id, int on) { if (id < 41u) host_lit[id] = (uint8_t)(on != 0); }
 static void fm1_led_bg_all(int on) { (void)on; }
-static void fm1_led_glow_key(uint32_t id, int on) { (void)id; (void)on; }
+static void fm1_led_glow_key(uint32_t id, int on) { if (id < 41u) host_glow[id] = (uint8_t)(on != 0); }
 static volatile uint16_t fm1_led_bg_ns;
 
 /* the second core (hal/fm1_multicore.h): HOST_MC=0 none (stage 2 on core 0), 1 the job at once (before stage 1),
@@ -259,6 +260,7 @@ static void platform_poll(void)                 /* one call = one millisecond */
         memset(blk, 0, sizeof blk);
         app_audio(blk, HALF_FRAMES);
         if (getenv("HOST_STEMS")) usb_stems = 1;
+        if (getenv("HOST_PROF")) prof_req = 1;
         if (usb_stems) {                        /* the stems' level: peaks and samples at the rail (HOST_STEMS report at the end) */
             uint32_t k;
             for (k = 0; k < HALF_FRAMES * 6u; k++) {
@@ -278,11 +280,26 @@ static void platform_poll(void)                 /* one call = one millisecond */
         if ((uint64_t)frame * 1000u <= (uint64_t)fm1_ms * frame_fps) {
             char name[512];
             snprintf(name, sizeof name, "%s-%05u.ppm", host_out, frame++);
+            if (getenv("HOST_LEDS")) {   /* the panel's LEDs at this frame: buttons by id, keys by number (lit *, glow .) */
+                uint32_t id;
+                printf("%6u ms  LEDS ", fm1_ms);
+                for (id = 0; id < 41u; id++) if (host_lit[id] || host_glow[id]) printf("%u%c ", id, host_lit[id] ? '*' : '.');
+                printf("\n");
+            }
             write_ppm_as(name);
         }
     } else if (shot < sizeof SHOT / sizeof SHOT[0] && fm1_ms == SHOT[shot])
         write_ppm(SHOT[shot++]);
     if (fm1_ms >= end_ms) {
+        if (prof_blocks) {   /* where a block's time goes (x86 cycles: the shares, not the device's numbers) */
+            static const char *const PN[PF_N] = {"pre", "seq", "ctl", "osc", "filter", "fold", "split", "burst", "post",
+                                                 "s2 decim", "s2 low", "s2 crush+ott", "s2 freeze", "s2 phaser", "s2 delay", "s2 drums", "s2 out"};
+            uint64_t tot = 0; int k;
+            for (k = 0; k < PF_N; k++) tot += prof_acc[k];
+            printf("profile over %u blocks (per block avg, cycles):\n", prof_blocks);
+            for (k = 0; k < PF_N; k++) printf("  %-14s %8u  %5.1f %%\n", PN[k], prof_acc[k] / prof_blocks, 100.0 * prof_acc[k] / (double)tot);
+            printf("  total avg %llu  max block %u\n", (unsigned long long)(tot / prof_blocks), prof_max);
+        }
         if (usb_stems) { int c; printf("stems peak/rail:"); for (c = 0; c < 6; c++) printf(" %d/%u", stem_pk[c], stem_rail[c]); printf("\n"); }
         write_wav();
         exit(0);

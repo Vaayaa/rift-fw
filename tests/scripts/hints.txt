@@ -1,0 +1,12 @@
+# hints: SEQ held (lit combos, lane/slot keys), lane lock by holding F3, REC held while playing, a throw held
+1000 btn 12
+1040 btnup 12
+2000 btn 11
+2500 keys 0x1
+3200 keys 0x0
+3300 btnup 11
+4000 btn 13
+4800 btnup 13
+5500 btn 2
+6300 btnup 2
+7000 end
