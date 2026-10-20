@@ -59,6 +59,38 @@ python3 tools/fm1_install.py build/rift-0.3.fwsc   # 写入前会先询问确认
 | ALGO / PRESET | 切音色预设（10 个，跨 5 个引擎）/ 切音序槽（下一小节生效） |
 | 琴键 | 停止时弹贝斯（按住越久越亮；同键快速双击 = 重音）；播放中按键 = 按音阶级数移调 |
 
+## MIDI 输入：让 DAW 来弹（0.5.1）
+
+只收本机通道（SYS 页 CH，默认 ch1）。
+
+- **用法**：SYS > **SYNC = INT**，不要按 PLAY。这样 Ableton 的时钟和 Start 不会启动 RIFT 自己的音序器；
+  音序器在走时，收到的音符是「按音阶移调」，不是弹出来。
+- **音符**：收到的音符 n 发出的音高 = 标准 MIDI 音符 n − 24（低两个八度）。例：发 MIDI 60（Ableton 叫 C3，
+  中央 C）→ 发出 MIDI 36 的音高（65.4 Hz，Ableton 叫 C1）。想让 RIFT 发出某个音高，就发「那个音的 MIDI 号 + 24」。
+  面板琴键往外发的音符同样减了 24，录下来回放音高一致。
+- **力度**：≥ 100 = 重音（accent），< 100 = 普通。
+- **滑音**：前一个音还按着时来的新音 = slide（legato 重叠）。
+- **Program Change**：
+
+  | PC | 预设 | 引擎 |
+  |---|---|---|
+  | 0 | PHUTURE 88 | ACID |
+  | 1 | SQUELCH | ACID |
+  | 2 | RUBBER | ACID |
+  | 3 | DIRT | ACID |
+  | 4 | BUNKER | RUMBLE |
+  | 5 | PRESSURE | RUMBLE |
+  | 6 | BREAK REESE | REESE |
+  | 7 | FIRESTORM | REESE |
+  | 8 | BLOCK ROCK | GROWL |
+  | 9 | ACID SIREN | SCREAM |
+  | 100–107 | 音序槽 1–8（播放中下一小节生效） | — |
+
+  和拧 ALGO 到那个预设一样（旋钮值全换成预设值）；正在按着的音不断，直接换成新音色。屏幕顶部显示 PRESET n / PATTERN n。
+  其他 PC 号忽略。
+- CC：74 cutoff · 71 resonance · 1 爆（同前）。
+- USB MIDI 设备名：**RIFT FM-1**（macOS 端口同名；以前连过的机器可能还显示旧名字）。
+
 ## MIDI 输出（用于 TouchDesigner）
 
 - ch1：音符。

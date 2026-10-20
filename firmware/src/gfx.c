@@ -17,7 +17,11 @@ typedef struct {               /* proportional, see tools/gen_font.py */
 #ifndef CV_MAX
 #define CV_MAX (240u * 124u)      /* the graph strip is 240 x 124 */
 #endif
+#ifdef __APPLE__
+static uint16_t cv_px[CV_MAX];                  /* (a Mac host: Mach-O has no ".pool") */
+#else
 static uint16_t cv_px[CV_MAX] __attribute__((section(".pool")));
+#endif
 static uint32_t cv_w, cv_h;
 static int32_t cv_oy;            /* y offset for graph drawing */
 

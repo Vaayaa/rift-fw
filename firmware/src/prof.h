@@ -8,9 +8,13 @@ enum { PF_PRE, PF_SEQ, PF_CTL, PF_OSC, PF_FLT, PF_FOLD, PF_SPLIT, PF_BURST, PF_P
 static uint32_t prof_acc[PF_N], prof_blocks, prof_t, prof_t0, prof_max;
 static uint8_t prof_on;
 static volatile uint8_t prof_req;
-#ifdef DINGHY_HOST
+#if defined(DINGHY_HOST) && (defined(__x86_64__) || defined(__i386__))
 #include <x86intrin.h>
 #define PROF_NOW() ((uint32_t)__rdtsc())
+#elif defined(DINGHY_HOST)
+#include <time.h>
+static uint32_t prof_now_host(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint32_t)(t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec); }
+#define PROF_NOW() prof_now_host()                    /* (an ARM Mac: ns) */
 #else
 #define PROF_NOW() fm1_ticks()                        /* TIMER4, 24 MHz */
 #endif

@@ -1,0 +1,14 @@
+# 0.5.1: velocity accent, Program Change (presets 0-9, patterns 100-107), other channels ignored
+1800 midi 0x90 48 120
+2200 midi 0x80 48 0
+2400 midi 0x90 48 80
+2800 midi 0x80 48 0
+3000 midi 0xC0 3 0
+3200 midi 0x90 36 127
+3500 midi 0xC0 6 0
+3900 midi 0x80 36 0
+4100 midi 0xC0 101 0
+4400 midi 0xC0 12 0
+4500 midi 0x91 48 120
+4900 midi 0x81 48 0
+5300 end

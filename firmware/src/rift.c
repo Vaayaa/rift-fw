@@ -1775,6 +1775,28 @@ static void load_preset(int i)
     U.dirty_all = 1;
 }
 
+/* 0.5.1: Program Change on this unit's channel: 0-9 = preset n (as ALGO turned to it), 100-107 = sequence slot 1-8
+ * (as PRESETS turned to it: at the next bar while playing). The gate is left alone: a held note keeps sounding
+ * with the new preset's sound. */
+static void pc_in(uint32_t n)
+{
+    static char m[20];
+    uint32_t i = 0;
+    const char *t;
+    if (n < NPRESET) {
+        load_preset((int)n);
+        for (t = "PRESET "; *t; ) m[i++] = *t++;
+        if (n >= 10u) m[i++] = (char)('0' + n / 10u);
+        m[i++] = (char)('0' + n % 10u); m[i] = 0;
+        say(m);
+    } else if (n >= 100u && n < 108u) {
+        save_slot(); load_slot((int)n - 100, 1);
+        for (t = "PATTERN "; *t; ) m[i++] = *t++;
+        m[i++] = (char)('1' + n - 100u); m[i] = 0;
+        say(m);
+    }
+}
+
 /* the sound dice: a new voice for the engine, inside the ranges that engine sounds good in */
 static volatile int32_t *const DICE_P[16] = {&P.cut, &P.res, &P.env, &P.dec, &P.acc, &P.burst, &P.chr, &P.drive, &P.sub,
                                               &P.fold, &P.formant, &P.ratio, &P.rel, &P.glide, &P.dly_send, &P.eng};
@@ -2744,7 +2766,8 @@ static void app_main(void)
         /* MIDI in */
         while (midi_get(&st, &d1, &d2)) {
             if ((st & 0x0Fu) != (uint32_t)U.chan) continue;   /* this unit's channel only */
-            if ((st & 0xF0u) == 0x90u && d2) cmd(OP_ON, d1, 0);
+            if ((st & 0xF0u) == 0x90u && d2) cmd(OP_ON, d1, d2 >= 100u);   /* 0.5.1: velocity 100+ = accent */
+            else if ((st & 0xF0u) == 0xC0u) pc_in(d1);                    /* 0.5.1: Program Change */
             else if ((st & 0xF0u) == 0x80u || (st & 0xF0u) == 0x90u) cmd(OP_OFF, d1, 0);
             else if ((st & 0xF0u) == 0xB0u) { if (d1 == 74) P.cut = d2 * 516; else if (d1 == 71) P.res = d2 * 516; else if (d1 == 1) P.burst = d2 * 516; }
         }
